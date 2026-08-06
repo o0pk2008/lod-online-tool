@@ -1,0 +1,22 @@
+# dependencies
+node_modules/
+
+# local data (large splat assets)
+input/*
+!input/.gitkeep
+output/*
+!output/.gitkeep
+
+# logs & OS
+*.log
+npm-debug.log*
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# env / editor
+.env
+.env.*
+.vscode/
+.idea/
+*.swp

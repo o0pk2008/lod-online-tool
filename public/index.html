@@ -1,0 +1,332 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>在线 LOD 转换工具</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        html, body {
+            height: 100%;
+            margin: 0;
+            background: #eef3f9;
+            font-family: Inter, -apple-system, system-ui, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+        }
+
+        #pcanvas {
+            width: 100%;
+            height: 100%;
+            display: block;
+            background: #0b1220;
+        }
+
+        .ts-range {
+            -webkit-appearance: none;
+            appearance: none;
+            height: 6px;
+            border-radius: 999px;
+            background: linear-gradient(90deg, #1d6feb 0%, #0b5fb9 100%);
+            outline: none;
+        }
+
+        .ts-range::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            appearance: none;
+            width: 18px;
+            height: 18px;
+            border-radius: 999px;
+            background: #ffffff;
+            border: 2px solid rgba(29, 111, 235, 0.9);
+            box-shadow: 0 6px 16px rgba(0, 0, 0, 0.18);
+            cursor: pointer;
+        }
+
+        .ts-range::-moz-range-thumb {
+            width: 18px;
+            height: 18px;
+            border-radius: 999px;
+            background: #ffffff;
+            border: 2px solid rgba(29, 111, 235, 0.9);
+            box-shadow: 0 6px 16px rgba(0, 0, 0, 0.18);
+            cursor: pointer;
+        }
+
+        .ts-range::-moz-range-track {
+            height: 6px;
+            border-radius: 999px;
+            background: linear-gradient(90deg, #1d6feb 0%, #0b5fb9 100%);
+        }
+    </style>
+    <script type="importmap">
+    {
+        "imports": {
+            "playcanvas": "https://cdn.jsdelivr.net/npm/playcanvas/+esm"
+        }
+    }
+    </script>
+</head>
+<body class="h-full text-[#1c2024]">
+    <div class="h-full flex flex-col overflow-hidden">
+        <header class="shrink-0 bg-gradient-to-r from-[#0b5fb9] via-[#1d6feb] to-[#0b5fb9] text-white border-b border-white/10">
+            <div class="w-full px-4 py-3 flex items-center gap-4">
+                <div class="flex items-center gap-2 font-semibold">
+                    <span class="inline-flex h-8 w-8 items-center justify-center rounded-xl bg-white/10 ring-1 ring-white/15">
+                        <svg class="h-5 w-5" viewBox="0 0 1024 1024" version="1.1" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+                            <path fill="currentColor" d="M0 0h438.857143v1024H0V0z m512 0h512v438.857143H512V0z m0 512h219.428571v219.428571H512V512z m292.571429 0h219.428571v219.428571h-219.428571V512z m-292.571429 292.571429h73.142857v73.142857H512v-73.142857z m146.285714 0h73.142857v73.142857H658.285714v-73.142857z m-146.285714 146.285714h73.142857v73.142857H512v-73.142857z m146.285714 0h73.142857v73.142857H658.285714v-73.142857z m146.285715 0h73.142857v73.142857h-73.142857v-73.142857z m146.285714 0h73.142857v73.142857h-73.142857v-73.142857z m-146.285714-146.285714h73.142857v73.142857h-73.142857v-73.142857z m146.285714 0h73.142857v73.142857h-73.142857v-73.142857z"></path>
+                        </svg>
+                    </span>
+                    <span class="text-[16px] md:text-[18px] tracking-[-0.2px]">TwinScape LOD 转换工具</span>
+                </div>
+
+                <div class="flex-1 hidden md:flex items-center justify-center">
+                    <div id="stepBar" class="flex items-center gap-4 text-[12px] font-semibold tracking-[0.2px]">
+                        <div data-step="1" class="flex items-center gap-2.5 opacity-100">
+                            <span data-step-dot class="inline-flex h-7 w-7 items-center justify-center rounded-full bg-white/20 ring-1 ring-white/40">1</span>
+                            <div class="leading-tight">
+                                <div class="text-white/75 text-[11px] font-medium">步骤 1</div>
+                                <div class="text-[13px]">选择路径</div>
+                            </div>
+                        </div>
+                        <div class="h-px w-10 bg-white/25"></div>
+                        <div data-step="2" class="flex items-center gap-2.5 opacity-70">
+                            <span data-step-dot class="inline-flex h-7 w-7 items-center justify-center rounded-full bg-white/10 ring-1 ring-white/25">2</span>
+                            <div class="leading-tight">
+                                <div class="text-white/75 text-[11px] font-medium">步骤 2</div>
+                                <div class="text-[13px]">设置参数</div>
+                            </div>
+                        </div>
+                        <div class="h-px w-10 bg-white/25"></div>
+                        <div data-step="3" class="flex items-center gap-2.5 opacity-70">
+                            <span data-step-dot class="inline-flex h-7 w-7 items-center justify-center rounded-full bg-white/10 ring-1 ring-white/25">3</span>
+                            <div class="leading-tight">
+                                <div class="text-white/75 text-[11px] font-medium">步骤 3</div>
+                                <div class="text-[13px]">转换任务</div>
+                            </div>
+                        </div>
+                        <div class="h-px w-10 bg-white/25"></div>
+                        <div data-step="4" class="flex items-center gap-2.5 opacity-70">
+                            <span data-step-dot class="inline-flex h-7 w-7 items-center justify-center rounded-full bg-white/10 ring-1 ring-white/25">4</span>
+                            <div class="leading-tight">
+                                <div class="text-white/75 text-[11px] font-medium">步骤 4</div>
+                                <div class="text-[13px]">三维预览</div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="hidden lg:flex items-center gap-2 text-[12px] text-white/80">
+                    <button id="helpBtn" type="button" class="inline-flex items-center gap-2 rounded-full bg-white/10 px-3 py-1.5 ring-1 ring-white/15 hover:bg-white/15">
+                        <span class="inline-block h-2 w-2 rounded-full bg-emerald-300"></span>
+                        <span>操作说明</span>
+                    </button>
+                </div>
+            </div>
+        </header>
+
+        <main class="flex-1 min-h-0">
+            <div class="h-full w-full p-4">
+                <div class="h-full grid grid-cols-1 xl:grid-cols-[300px_300px_340px_1fr] gap-4 min-h-0">
+                    <!-- 步骤 1：路径 -->
+                    <section class="rounded-2xl border border-[#dbe3f0] bg-white shadow-[0_12px_30px_rgba(12,28,60,0.08)] p-4 flex flex-col min-h-0 overflow-auto">
+                        <div class="mb-3">
+                            <div class="text-[12px] font-semibold text-[#1d6feb] tracking-[0.2px]">步骤 1 · 路径</div>
+                            <div class="text-[17px] font-semibold tracking-[-0.25px] text-[#0b1220]">导入 / 导出</div>
+                            <p class="mt-1 text-[12px] text-[#526077] leading-relaxed">
+                                指定高斯模型与输出目录。流水线为<strong>两段式</strong>（中间 PLY → lod-meta）。
+                            </p>
+                        </div>
+
+                        <div class="space-y-3">
+                            <div class="rounded-xl border border-[#dbe3f0] bg-[#f6f9ff] p-3">
+                                <div class="flex items-center justify-between gap-3 mb-2">
+                                    <label for="inputPath" class="text-[12px] font-semibold text-[#526077]">输入文件</label>
+                                    <button id="pickInputBtn" class="h-9 w-9 rounded-lg bg-[#0b5fb9] text-white ring-1 ring-black/5 hover:bg-[#0a57ab]" type="button" aria-label="选择输入文件" title="浏览选择">
+                                        <svg viewBox="0 0 24 24" class="h-5 w-5 mx-auto" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                                            <path d="M4 4h6l2 3h8v13H4z"></path>
+                                        </svg>
+                                    </button>
+                                </div>
+
+                                <div id="inputDropZone" class="relative rounded-xl border-2 border-dashed border-[#b7c9e8] bg-white/80 px-3 py-5 text-center transition-colors cursor-pointer hover:border-[#1d6feb] hover:bg-[#eef6ff]" tabindex="0" role="button" aria-label="拖放导入文件">
+                                    <input id="inputFileHidden" type="file" accept=".ply,.sog,.splat,.spz,.ksplat,.compressed.ply" class="hidden" />
+                                    <div class="flex flex-col items-center gap-1.5 pointer-events-none">
+                                        <svg class="h-8 w-8 text-[#1d6feb]/80" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                                            <path d="M12 16V4"></path>
+                                            <path d="M8 8l4-4 4 4"></path>
+                                            <path d="M4 14v4a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-4"></path>
+                                        </svg>
+                                        <div class="text-[13px] font-semibold text-[#0b1220]">拖拽文件到此处</div>
+                                        <div class="text-[11px] text-[#7b8494] leading-snug">或点击选择 · 支持 .ply / .sog / .splat / .spz</div>
+                                        <div id="inputDropHint" class="text-[11px] text-[#526077] mt-0.5 max-w-full truncate px-1">未选择文件</div>
+                                    </div>
+                                </div>
+
+                                <input id="inputPath" class="mt-2 w-full border border-[#cfd9ea] bg-white text-[#0b1220] px-3 py-2 rounded-xl focus:outline-none focus:ring-2 focus:ring-[#1d6feb]/20 focus:border-[#1d6feb] text-[13px]" placeholder="例如 input/model.ply 或绝对路径" />
+                                <div class="mt-1.5 text-[11px] text-[#7b8494]">也可粘贴完整路径；推荐文件放在仓库 <code class="text-[10px] bg-white px-1 rounded">input/</code> 下便于拖放识别</div>
+                            </div>
+
+                            <div class="rounded-xl border border-[#dbe3f0] bg-[#f6f9ff] p-3">
+                                <div class="flex items-center justify-between gap-3">
+                                    <label for="outputRoot" class="text-[12px] font-semibold text-[#526077]">输出目录</label>
+                                    <button id="pickOutputBtn" class="h-9 w-9 rounded-lg bg-[#0b5fb9] text-white ring-1 ring-black/5 hover:bg-[#0a57ab]" type="button" aria-label="选择输出目录" title="浏览选择">
+                                        <svg viewBox="0 0 24 24" class="h-5 w-5 mx-auto" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                                            <path d="M4 4h6l2 3h8v13H4z"></path>
+                                        </svg>
+                                    </button>
+                                </div>
+                                <input id="outputRoot" class="mt-2 w-full border border-[#cfd9ea] bg-white text-[#0b1220] px-3 py-2 rounded-xl focus:outline-none focus:ring-2 focus:ring-[#1d6feb]/20 focus:border-[#1d6feb] text-[13px]" placeholder="例如 output/model-name" />
+                                <div class="mt-1.5 text-[11px] text-[#7b8494]">默认随输入文件名自动变为 <code class="text-[10px] bg-white px-1 rounded">output/文件名</code>（可手动改）</div>
+                            </div>
+                        </div>
+                    </section>
+
+                    <!-- 步骤 2：参数 -->
+                    <aside id="settingsPanel" class="rounded-2xl border border-[#dbe3f0] bg-white/70 shadow-[0_12px_30px_rgba(12,28,60,0.08)] p-4 overflow-auto min-h-0">
+                        <div class="mb-3">
+                            <div class="text-[12px] font-semibold text-[#1d6feb] tracking-[0.2px]">步骤 2 · 参数</div>
+                            <div class="text-[17px] font-semibold tracking-[-0.25px] text-[#0b1220]">LOD 设置</div>
+                            <p class="mt-1 text-[12px] text-[#526077] leading-relaxed">
+                                层数越高越远景越粗糙。保留率越低，该层高斯越少、文件越小。
+                            </p>
+                        </div>
+
+                        <div class="grid grid-cols-2 gap-3 mb-3">
+                            <div>
+                                <label for="lodCount" class="block text-[11px] font-medium text-[#526077] mb-1">LOD 层数</label>
+                                <input id="lodCount" type="number" min="1" max="16" class="w-full border border-[#cfd9ea] bg-white text-[#0b1220] px-2.5 py-2 rounded-xl focus:outline-none focus:ring-2 focus:ring-[#1d6feb]/20 focus:border-[#1d6feb]" />
+                            </div>
+                            <div>
+                                <label for="chunkCountK" class="block text-[11px] font-medium text-[#526077] mb-1">分块规模 (-C)</label>
+                                <div class="relative">
+                                    <input id="chunkCountK" type="number" min="1" step="1" value="512" class="w-full border border-[#cfd9ea] bg-white text-[#0b1220] px-2.5 py-2 pr-8 rounded-xl focus:outline-none focus:ring-2 focus:ring-[#1d6feb]/20 focus:border-[#1d6feb]" />
+                                    <span class="pointer-events-none absolute right-2.5 top-1/2 -translate-y-1/2 text-[12px] text-[#526077]">K</span>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="mb-3 text-[11px] text-[#7b8494] leading-relaxed rounded-lg bg-[#f2f6fb] px-2.5 py-2">
+                            分块规模为全局参数（约 K×1000 个高斯/块）。数值越大，块越少但单块越大。
+                        </div>
+
+                        <div class="flex items-center justify-between mb-2">
+                            <div class="text-[12px] font-semibold text-[#526077]">各层保留率</div>
+                            <div class="text-[11px] text-[#7b8494]">L0 = 全量细节</div>
+                        </div>
+                        <div id="levelForm" class="space-y-2 min-w-0"></div>
+                    </aside>
+
+                    <!-- 步骤 3：转换任务 -->
+                    <section class="rounded-2xl border border-[#dbe3f0] bg-white shadow-[0_12px_30px_rgba(12,28,60,0.08)] p-4 flex flex-col min-h-0">
+                        <div class="flex items-start justify-between gap-3 mb-3">
+                            <div>
+                                <div class="text-[12px] font-semibold text-[#1d6feb] tracking-[0.2px]">步骤 3 · 转换</div>
+                                <div class="text-[17px] font-semibold tracking-[-0.25px] text-[#0b1220]">分块任务</div>
+                                <p class="mt-1 text-[12px] text-[#526077] leading-relaxed">
+                                    查看中间简化与分块进度，确认后开始转换。
+                                </p>
+                            </div>
+                            <div class="flex flex-col items-stretch gap-2 shrink-0">
+                                <button id="startBtn" class="px-4 py-2 bg-[#0b1220] text-white text-[13px] font-semibold rounded-full hover:opacity-90 disabled:opacity-70 disabled:cursor-not-allowed">
+                                    <span class="inline-flex items-center gap-2">
+                                        <svg id="startBtnSpinner" class="hidden h-3.5 w-3.5 animate-spin text-white" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                                            <circle class="opacity-30" cx="12" cy="12" r="9" stroke="currentColor" stroke-width="3"></circle>
+                                            <path class="opacity-100" d="M21 12a9 9 0 0 0-9-9" stroke="currentColor" stroke-width="3" stroke-linecap="round"></path>
+                                        </svg>
+                                        <span id="startBtnLabel">开始转换</span>
+                                    </span>
+                                </button>
+                                <button id="stopBtn" class="px-3 py-2 border border-[#cfd9ea] bg-white text-[13px] font-semibold rounded-full hover:bg-[#f6f9ff]">停止</button>
+                            </div>
+                        </div>
+
+                        <div class="flex-1 min-h-0 rounded-xl border border-[#dbe3f0] overflow-hidden flex flex-col">
+                            <div class="bg-white border-b border-[#dbe3f0] px-3 py-2 text-[12px] font-semibold text-[#526077] flex items-center justify-between">
+                                <span>任务列表</span>
+                                <span id="taskSummary" class="text-[11px] font-medium text-[#7b8494]">等待开始</span>
+                            </div>
+                            <div class="bg-white border-b border-[#dbe3f0] px-3 py-1.5 text-[11px] font-semibold text-[#7b8494] grid grid-cols-[100px_1fr_80px]">
+                                <div>名称</div>
+                                <div>进度</div>
+                                <div>状态</div>
+                            </div>
+                            <div class="bg-[#fbfcff] overflow-auto flex-1 min-h-0">
+                                <table class="w-full table-fixed text-[12px]">
+                                    <colgroup>
+                                        <col class="w-[100px]">
+                                        <col>
+                                        <col class="w-[80px]">
+                                    </colgroup>
+                                    <tbody id="taskTableBody"></tbody>
+                                </table>
+                            </div>
+                        </div>
+                    </section>
+
+                    <!-- 步骤 4：三维预览 -->
+                    <section class="rounded-2xl border border-[#0c1c3c]/20 bg-[#0b1220] shadow-[0_18px_50px_rgba(12,28,60,0.18)] overflow-hidden relative min-h-[360px]">
+                        <div class="absolute top-3 left-3 z-10 px-2.5 py-1 rounded-lg bg-white/10 text-white/90 text-[11px] font-semibold backdrop-blur ring-1 ring-white/10 pointer-events-none">
+                            步骤 4 · 三维预览
+                        </div>
+                        <canvas id="pcanvas"></canvas>
+                        <div class="absolute top-10 left-3 px-3 py-2 rounded-xl bg-white/10 text-white backdrop-blur ring-1 ring-white/10 text-[12px]">
+                            <div class="font-semibold">视口状态</div>
+                            <div class="text-white/80">LOD <span id="currentLod" class="text-white font-semibold">-</span> · 块 <span id="chunkCount" class="text-white font-semibold">0</span></div>
+                            <div id="viewModeLabel" class="text-white/60 text-[11px] mt-0.5">等待数据</div>
+                        </div>
+                        <div class="absolute top-3 right-3 flex gap-2">
+                            <button id="resetCameraBtn" type="button" class="px-3 py-1.5 rounded-lg bg-white/10 text-white text-[12px] font-medium backdrop-blur ring-1 ring-white/15 hover:bg-white/15" title="重置视角">
+                                重置视角
+                            </button>
+                        </div>
+                        <div class="absolute bottom-3 left-3 right-3 flex flex-wrap gap-2 text-[11px] text-white/70 pointer-events-none">
+                            <span class="rounded-md bg-black/35 px-2 py-1 ring-1 ring-white/10">左键旋转</span>
+                            <span class="rounded-md bg-black/35 px-2 py-1 ring-1 ring-white/10">右键平移</span>
+                            <span class="rounded-md bg-black/35 px-2 py-1 ring-1 ring-white/10">滚轮缩放</span>
+                        </div>
+                    </section>
+                </div>
+            </div>
+        </main>
+
+        <footer class="shrink-0 border-t border-[#dbe3f0] bg-white/80 backdrop-blur">
+            <div class="w-full px-4 py-2 flex items-center gap-3 text-[12px] text-[#526077]">
+                <div class="inline-flex items-center gap-2 rounded-full bg-[#f2f6fb] px-3 py-1 ring-1 ring-[#0c1c3c]/8">
+                    <span id="statusDot" class="inline-block h-2 w-2 rounded-full bg-[#1d6feb]"></span>
+                    <span id="statusPhase">就绪</span>
+                </div>
+                <div id="progressText" class="flex-1 min-w-0 truncate">① 路径 → ② 参数 → ③ 转换任务 → ④ 三维预览</div>
+                <div class="w-52 max-w-[40vw] h-2 rounded-full bg-[#e9eef6] ring-1 ring-[#0c1c3c]/10 overflow-hidden">
+                    <div id="progressBar" class="h-full w-0 bg-[#1d6feb] transition-all"></div>
+                </div>
+            </div>
+        </footer>
+    </div>
+
+    <div id="helpModal" class="hidden fixed inset-0 z-50 items-center justify-center bg-black/40 p-4">
+        <div class="w-full max-w-lg rounded-2xl bg-white shadow-2xl border border-[#dbe3f0] overflow-hidden">
+            <div class="px-5 py-4 border-b border-[#e8eef7] flex items-center justify-between">
+                <div class="text-[16px] font-semibold text-[#0b1220]">操作说明</div>
+                <button id="helpCloseBtn" type="button" class="h-8 w-8 rounded-lg text-[#526077] hover:bg-[#f2f6fb]" aria-label="关闭">✕</button>
+            </div>
+            <div class="px-5 py-4 text-[13px] text-[#3b4453] space-y-3 leading-relaxed">
+                <p><strong>1. 选择路径</strong>：指定高斯模型与输出目录（最左侧栏）。</p>
+                <p><strong>2. 设置参数</strong>：LOD 层数、保留率、分块规模（路径右侧栏）。</p>
+                <p><strong>3. 转换任务</strong>：在参数栏右侧查看中间文件/分块进度，点击「开始转换」。</p>
+                <ul class="list-disc pl-5 space-y-1 text-[12px]">
+                    <li><strong>阶段1</strong>：串行生成中间 PLY（<code class="bg-[#f2f6fb] px-1 rounded">_intermediates/L*.ply</code>）</li>
+                    <li><strong>阶段2</strong>：合成 <code class="bg-[#f2f6fb] px-1 rounded">lod-meta.json</code> 与分块</li>
+                </ul>
+                <p><strong>4. 三维预览</strong>：最右侧视口实时预览；完成后加载分层流式结果。</p>
+                <p class="text-[#7b8494] text-[12px]">提示：已有中间文件会跳过（断点续跑）。全量重算请先清空输出目录。</p>
+            </div>
+            <div class="px-5 py-3 border-t border-[#e8eef7] flex justify-end">
+                <button id="helpOkBtn" type="button" class="px-4 py-2 rounded-full bg-[#0b1220] text-white text-[13px] font-semibold">知道了</button>
+            </div>
+        </div>
+    </div>
+
+    <script type="module" src="/app.js"></script>
+</body>
+</html>
