@@ -2,7 +2,7 @@
   "name": "lod-online-tool",
   "version": "1.0.0",
   "private": true,
-  "description": "TwinScape online UI for multi-level Gaussian splat LOD conversion (two-phase pipeline + PlayCanvas preview)",
+  "description": "TwinScape online UI for Gaussian splat LOD conversion and keep-ratio compression (PlayCanvas preview)",
   "type": "module",
   "scripts": {
     "start": "node server.mjs",

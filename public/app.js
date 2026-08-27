@@ -5,8 +5,12 @@ import {
     Color,
     Entity,
     FILLMODE_NONE,
+    LAYERID_IMMEDIATE,
+    LAYERID_WORLD,
+    Layer,
     RESOLUTION_AUTO,
-    Vec3
+    Vec3,
+    Vec4
 } from 'playcanvas';
 
 const inputPathEl = document.getElementById('inputPath');
@@ -21,6 +25,9 @@ const startBtnSpinner = document.getElementById('startBtnSpinner');
 const stopBtn = document.getElementById('stopBtn');
 const pickInputBtn = document.getElementById('pickInputBtn');
 const pickOutputBtn = document.getElementById('pickOutputBtn');
+const downloadOutputBtn = document.getElementById('downloadOutputBtn');
+const downloadOutputHint = document.getElementById('downloadOutputHint');
+const importPreviewBtn = document.getElementById('importPreviewBtn');
 const inputDropZone = document.getElementById('inputDropZone');
 const inputFileHidden = document.getElementById('inputFileHidden');
 const inputDropHint = document.getElementById('inputDropHint');
@@ -35,14 +42,63 @@ const statusDotEl = document.getElementById('statusDot');
 const statusPhaseEl = document.getElementById('statusPhase');
 const stepBarEl = document.getElementById('stepBar');
 const resetCameraBtn = document.getElementById('resetCameraBtn');
+const lodDebugBtn = document.getElementById('lodDebugBtn');
+const lodDebugPanel = document.getElementById('lodDebugPanel');
+const lodColorizeToggle = document.getElementById('lodColorizeToggle');
+const lodColorLegend = document.getElementById('lodColorLegend');
+const lodIsolateSelect = document.getElementById('lodIsolateSelect');
+const lodBaseDistanceRange = document.getElementById('lodBaseDistanceRange');
+const lodBaseDistanceVal = document.getElementById('lodBaseDistanceVal');
+const lodMultiplierRange = document.getElementById('lodMultiplierRange');
+const lodMultiplierVal = document.getElementById('lodMultiplierVal');
 const helpBtn = document.getElementById('helpBtn');
 const helpModal = document.getElementById('helpModal');
 const helpCloseBtn = document.getElementById('helpCloseBtn');
 const helpOkBtn = document.getElementById('helpOkBtn');
 const canvas = document.getElementById('pcanvas');
+const modeLodBtn = document.getElementById('modeLodBtn');
+const modeCompressBtn = document.getElementById('modeCompressBtn');
+const pathDescEl = document.getElementById('pathDesc');
+const settingsTitleEl = document.getElementById('settingsTitle');
+const settingsDescEl = document.getElementById('settingsDesc');
+const lodSettingsBlock = document.getElementById('lodSettingsBlock');
+const compressSettingsBlock = document.getElementById('compressSettingsBlock');
+const keepPercentRange = document.getElementById('keepPercentRange');
+const keepPercentInput = document.getElementById('keepPercentInput');
+const keepPercentHint = document.getElementById('keepPercentHint');
+const convertTitleEl = document.getElementById('convertTitle');
+const convertDescEl = document.getElementById('convertDesc');
+const compareUi = document.getElementById('compareUi');
+const compareDivider = document.getElementById('compareDivider');
+const compareLabelLeft = document.getElementById('compareLabelLeft');
+const compareLabelRight = document.getElementById('compareLabelRight');
 
 const CONFIG_STORAGE_KEY = 'lod-online-tool:config:v1';
 const INPUT_EXTS = ['.ply', '.sog', '.splat', '.spz', '.ksplat'];
+const WORK_MODE = {
+    lod: 'lod',
+    compress: 'compress'
+};
+const COPY = {
+    lod: {
+        pathDesc: '指定高斯模型与输出目录。流水线为两段式（中间 PLY → lod-meta）。',
+        settingsTitle: 'LOD 设置',
+        settingsDesc: '层数越高越远景越粗糙。保留率越低，该层高斯越少、文件越小。',
+        convertTitle: '分块任务',
+        convertDesc: '查看中间简化与分块进度，确认后开始转换。',
+        startIdle: '开始转换',
+        startBusy: '转换中…'
+    },
+    compress: {
+        pathDesc: '指定高斯模型与输出目录。按保留比例简化为单个 PLY，不生成分层 LOD。',
+        settingsTitle: '压缩设置',
+        settingsDesc: '保留比例越低，高斯越少、文件越小。例如 60% 即压缩到原来的六成。',
+        convertTitle: '压缩任务',
+        convertDesc: '查看简化进度，确认后开始压缩。完成后可左右对比预览。',
+        startIdle: '开始压缩',
+        startBusy: '压缩中…'
+    }
+};
 
 /** Last auto-suggested output path; used so we only overwrite output when still "auto" */
 let lastSuggestedOutput = '';
@@ -70,9 +126,15 @@ const PREVIEW_MODE = {
     none: 'none',
     intermediate: 'intermediate',
     chunks: 'chunks',
-    final: 'final'
+    final: 'final',
+    compare: 'compare'
 };
 let previewMode = PREVIEW_MODE.none;
+let currentMode = WORK_MODE.lod;
+let keepPercent = 60;
+let compareSplit = 0.5;
+let isDraggingSplit = false;
+let lastComparePayload = null;
 
 const app = new Application(canvas, {
     graphicsDeviceOptions: {
@@ -191,6 +253,115 @@ const frameEntityInView = (entity) => {
 
 resetCameraHome();
 
+const DEFAULT_CAMERA_LAYERS = camera.camera.layers.slice();
+const compareOriginalLayer = new Layer({ name: 'compareOriginal' });
+const compareCompressedLayer = new Layer({ name: 'compareCompressed' });
+app.scene.layers.push(compareOriginalLayer);
+app.scene.layers.push(compareCompressedLayer);
+
+const compareCamera = new Entity('CompareCamera');
+compareCamera.addComponent('camera', {
+    clearColor: [0.09, 0.1, 0.12, 1],
+    nearClip: CAMERA_NEAR,
+    farClip: CAMERA_FAR,
+    priority: 1,
+    layers: [LAYERID_WORLD, LAYERID_IMMEDIATE, compareCompressedLayer.id]
+});
+compareCamera.camera.clearColorBuffer = false;
+compareCamera.camera.clearDepthBuffer = true;
+if (compareCamera.camera.camera) {
+    compareCamera.camera.camera._scissorRectClear = true;
+}
+compareCamera.enabled = false;
+app.root.addChild(compareCamera);
+
+const formatBytes = (n) => {
+    if (n == null || !Number.isFinite(Number(n))) return '?';
+    const v = Number(n);
+    if (v < 1024) return `${v} B`;
+    if (v < 1024 * 1024) return `${(v / 1024).toFixed(1)} KB`;
+    if (v < 1024 * 1024 * 1024) return `${(v / (1024 * 1024)).toFixed(1)} MB`;
+    return `${(v / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+};
+
+const formatCount = (n) => {
+    if (n == null || !Number.isFinite(Number(n))) return null;
+    return Number(n).toLocaleString('zh-CN');
+};
+
+const syncCompareCameraTransform = () => {
+    if (!compareCamera.enabled) return;
+    compareCamera.setPosition(camera.getPosition());
+    compareCamera.setRotation(camera.getRotation());
+    const src = camera.camera;
+    const dst = compareCamera.camera;
+    dst.nearClip = src.nearClip;
+    dst.farClip = src.farClip;
+    dst.fov = src.fov;
+};
+
+const applyCompareSplit = (ratio) => {
+    compareSplit = clamp(ratio, 0.08, 0.92);
+    if (compareDivider) {
+        compareDivider.style.left = `${compareSplit * 100}%`;
+    }
+    if (!compareCamera.enabled) return;
+    camera.camera.scissorRect = new Vec4(0, 0, compareSplit, 1);
+    compareCamera.camera.scissorRect = new Vec4(compareSplit, 0, 1 - compareSplit, 1);
+};
+
+const setCompareUiVisible = (visible) => {
+    if (!compareUi) return;
+    compareUi.classList.toggle('hidden', !visible);
+};
+
+const disableCompareView = () => {
+    compareCamera.enabled = false;
+    camera.camera.scissorRect = new Vec4(0, 0, 1, 1);
+    camera.camera.layers = DEFAULT_CAMERA_LAYERS.slice();
+    setCompareUiVisible(false);
+};
+
+const enableCompareView = () => {
+    camera.camera.layers = [
+        ...DEFAULT_CAMERA_LAYERS,
+        compareOriginalLayer.id
+    ];
+    compareCamera.camera.layers = [
+        LAYERID_WORLD,
+        LAYERID_IMMEDIATE,
+        compareCompressedLayer.id
+    ];
+    compareCamera.camera.clearColorBuffer = false;
+    compareCamera.camera.clearDepthBuffer = true;
+    if (compareCamera.camera.camera) {
+        compareCamera.camera.camera._scissorRectClear = true;
+    }
+    compareCamera.enabled = true;
+    setCompareUiVisible(true);
+    applyCompareSplit(compareSplit);
+    syncCompareCameraTransform();
+};
+
+const updateCompareLabels = (payload = {}) => {
+    const keep = Number(payload.keepPercent ?? keepPercent);
+    const origParts = ['原始'];
+    const origCount = formatCount(payload.originalCount);
+    if (origCount) origParts.push(`${origCount} 点`);
+    if (payload.originalSizeBytes != null) origParts.push(formatBytes(payload.originalSizeBytes));
+    if (compareLabelLeft) {
+        compareLabelLeft.textContent = origParts.join(' · ');
+    }
+    const compParts = ['压缩后'];
+    if (Number.isFinite(keep)) compParts.push(`${keep}%`);
+    const compCount = formatCount(payload.compressedCount);
+    if (compCount) compParts.push(`${compCount} 点`);
+    if (payload.compressedSizeBytes != null) compParts.push(formatBytes(payload.compressedSizeBytes));
+    if (compareLabelRight) {
+        compareLabelRight.textContent = compParts.join(' · ');
+    }
+};
+
 const drawReferenceGrid = () => {
     const size = 20;
     const step = 1;
@@ -212,6 +383,7 @@ const drawReferenceGrid = () => {
 
 app.on('update', () => {
     drawReferenceGrid();
+    syncCompareCameraTransform();
 });
 
 let isLeftDown = false;
@@ -231,6 +403,7 @@ window.addEventListener('mouseup', (e) => {
     if (e.button === 2) isRightDown = false;
 });
 window.addEventListener('mousemove', (e) => {
+    if (isDraggingSplit) return;
     const dx = e.clientX - lastX;
     const dy = e.clientY - lastY;
     lastX = e.clientX;
@@ -381,9 +554,127 @@ const setHelpOpen = (open) => {
     helpModal.classList.toggle('flex', open);
 };
 
+const unloadGsplatAsset = (entity) => {
+    try {
+        const assetId = entity?.gsplat?.asset;
+        const asset = assetId == null ? null : app.assets.get(assetId);
+        if (asset) {
+            app.assets.remove(asset);
+            asset.unload();
+        }
+    } catch {
+        // ignore engine version differences
+    }
+};
+
+const LOD_DEBUG_COLORS = [
+    '#ff3b30',
+    '#34c759',
+    '#007aff',
+    '#ffcc00',
+    '#af52de',
+    '#5ac8fa',
+    '#ff9500',
+    '#8e8e93'
+];
+
+const DEBUG_LOD = 1;
+const DEBUG_NONE = 0;
+
+const getActiveLodGsplat = () => {
+    for (let i = chunkEntities.length - 1; i >= 0; i -= 1) {
+        if (chunkEntities[i]?.gsplat) return chunkEntities[i].gsplat;
+    }
+    return null;
+};
+
+const setLodColorize = (enabled) => {
+    const gsplatGlobal = app.scene?.gsplat;
+    if (!gsplatGlobal) return;
+    if (typeof gsplatGlobal.debug !== 'undefined') {
+        gsplatGlobal.debug = enabled ? DEBUG_LOD : DEBUG_NONE;
+        return;
+    }
+    if (typeof gsplatGlobal.colorizeLod !== 'undefined') {
+        gsplatGlobal.colorizeLod = enabled;
+    }
+};
+
+const getLodLevelsForDebug = () => {
+    const lods = (levelState || [])
+        .map((level) => Number(level.lod))
+        .filter((lod) => Number.isInteger(lod) && lod >= 0);
+    const unique = [...new Set(lods)].sort((a, b) => a - b);
+    return unique.length > 0 ? unique : [0, 1, 2, 3, 4, 5];
+};
+
+const renderLodColorLegend = () => {
+    if (!lodColorLegend) return;
+    const lods = getLodLevelsForDebug();
+    lodColorLegend.innerHTML = lods.map((lod) => {
+        const color = LOD_DEBUG_COLORS[lod % LOD_DEBUG_COLORS.length];
+        const hint = lod === 0 ? '近' : lod >= 4 ? '远' : '中';
+        return `<span class="inline-flex items-center gap-1 rounded-md bg-white/10 px-1.5 py-0.5 text-[10px] ring-1 ring-white/10">
+            <span class="inline-block h-2 w-2 rounded-full" style="background:${color}"></span>L${lod}${hint}
+        </span>`;
+    }).join('');
+};
+
+const populateLodIsolateSelect = () => {
+    if (!lodIsolateSelect) return;
+    const current = lodIsolateSelect.value || 'all';
+    const lods = getLodLevelsForDebug();
+    lodIsolateSelect.innerHTML = '<option value="all">全部（距离流式）</option>'
+        + lods.map((lod) => `<option value="${lod}">仅 L${lod}</option>`).join('');
+    lodIsolateSelect.value = [...lodIsolateSelect.options].some((opt) => opt.value === current) ? current : 'all';
+};
+
+const applyLodDebugSettings = () => {
+    const gsplat = getActiveLodGsplat();
+    if (!gsplat) return;
+    const isolate = lodIsolateSelect?.value || 'all';
+    if (isolate === 'all') {
+        gsplat.lodRangeMin = 0;
+        gsplat.lodRangeMax = 99;
+        currentLodEl.textContent = 'ALL';
+    } else {
+        const lod = Number(isolate);
+        gsplat.lodRangeMin = lod;
+        gsplat.lodRangeMax = lod;
+        currentLodEl.textContent = `L${lod}`;
+    }
+    if (lodBaseDistanceRange) {
+        const dist = Math.max(0.1, Number(lodBaseDistanceRange.value) || 10);
+        gsplat.lodBaseDistance = dist;
+        if (lodBaseDistanceVal) lodBaseDistanceVal.textContent = String(dist);
+    }
+    if (lodMultiplierRange) {
+        const mult = Math.max(0.1, (Number(lodMultiplierRange.value) || 10) / 10);
+        gsplat.lodMultiplier = mult;
+        if (lodMultiplierVal) lodMultiplierVal.textContent = mult.toFixed(1);
+    }
+    setLodColorize(Boolean(lodColorizeToggle?.checked));
+};
+
+const setLodDebugUiVisible = (visible) => {
+    lodDebugBtn?.classList.toggle('hidden', !visible);
+    if (!visible) {
+        lodDebugPanel?.classList.add('hidden');
+        if (lodColorizeToggle) lodColorizeToggle.checked = false;
+        setLodColorize(false);
+    } else {
+        populateLodIsolateSelect();
+        renderLodColorLegend();
+        applyLodDebugSettings();
+    }
+};
+
 const clearCurrentLevelRender = () => {
+    setLodDebugUiVisible(false);
+    disableCompareView();
     while (chunkEntities.length > 0) {
         const entity = chunkEntities.pop();
+        unloadGsplatAsset(entity);
         entity.destroy();
     }
     loadedChunks.clear();
@@ -405,13 +696,16 @@ const loadGsplatUrl = async (url, options = {}) => {
         lodMultiplier = 1,
         retries = 6,
         /** When false, skip auto camera framing (e.g. loading many chunks) */
-        frameCamera = true
+        frameCamera = true,
+        layers = null,
+        cacheKey = ''
     } = options;
 
     let lastError = null;
     for (let attempt = 0; attempt < retries; attempt += 1) {
         try {
-            const cacheBusted = `${url}${url.includes('?') ? '&' : '?'}v=${Date.now()}-${attempt}`;
+            const bust = `${cacheKey || Date.now()}-${attempt}-${Date.now()}`;
+            const cacheBusted = `${url}${url.includes('?') ? '&' : '?'}v=${encodeURIComponent(bust)}`;
             const asset = new Asset(name, 'gsplat', { url: cacheBusted });
             const loader = new AssetListLoader([asset], app.assets);
             await new Promise((resolve, reject) => {
@@ -430,6 +724,9 @@ const loadGsplatUrl = async (url, options = {}) => {
                 gsplatOpts.lodMultiplier = lodMultiplier;
             }
             entity.addComponent('gsplat', gsplatOpts);
+            if (Array.isArray(layers) && layers.length > 0 && entity.gsplat) {
+                entity.gsplat.layers = layers.slice();
+            }
             app.root.addChild(entity);
             chunkEntities.push(entity);
 
@@ -520,15 +817,130 @@ const loadFinalLodMeta = async (metaUrl) => {
             retries: 6
         });
         chunkCountEl.textContent = 'meta';
-        setViewMode('阶段完成 · 分层流式 lod-meta');
+        setViewMode('分层 LOD 流式预览 · lod-meta.json');
         setWorkflowStep(4);
         setStatusPhase('完成', 'ok');
-        setProgress('转换完成：已加载完整多层 LOD，可在视口中检查效果。', 100);
+        setProgress('转换完成：已加载完整多层 LOD。可用「LOD 调试」按层级着色查看。', 100);
+        setLodDebugUiVisible(true);
         return true;
     } catch (error) {
         setStatusPhase('完成(预览失败)', 'warn');
         setProgress(`最终 lod-meta 加载失败: ${error.message || error}`);
         return false;
+    }
+};
+
+/**
+ * Split-view preview: original on the left, compressed on the right.
+ * Both cameras share the same projection; scissor clips without changing aspect.
+ */
+const loadComparePreview = async (payload) => {
+    lastComparePayload = payload || lastComparePayload;
+    const data = lastComparePayload || {};
+    const originalUrl = data.originalUrl || data.originalPreviewUrl;
+    const compressedUrl = data.compressedUrl || data.compressedPreviewUrl;
+
+    clearCurrentLevelRender();
+    previewMode = PREVIEW_MODE.compare;
+    pipelinePhase = 3;
+    currentLodEl.textContent = `${Number(data.keepPercent ?? keepPercent)}%`;
+    updateCompareLabels(data);
+    setWorkflowStep(4);
+
+    const markSplitSuccess = () => {
+        chunkCountEl.textContent = '2';
+        loadedChunkCount = 2;
+        setStatusPhase('完成', 'ok');
+        const keep = Number(data.keepPercent ?? keepPercent);
+        const sizeHint = (data.originalSizeBytes != null && data.compressedSizeBytes != null)
+            ? ` 体积 ${formatBytes(data.originalSizeBytes)} → ${formatBytes(data.compressedSizeBytes)}。`
+            : '';
+        setViewMode('对比预览 · 左原始 / 右压缩 · 拖动中线');
+        setProgress(`压缩完成：保留 ${keep}%。拖动中间分割线对比效果。${sizeHint}`, 100);
+    };
+
+    const markSingleSuccess = (label) => {
+        chunkCountEl.textContent = '1';
+        loadedChunkCount = 1;
+        setStatusPhase('完成', 'ok');
+        setViewMode(label);
+    };
+
+    const loadSingle = async (url, label) => {
+        disableCompareView();
+        previewMode = PREVIEW_MODE.compare;
+        await loadGsplatUrl(url, {
+            name: `compress-single-${Date.now()}`,
+            unified: true,
+            frameCamera: true,
+            retries: 3,
+            cacheKey: `${data.keepPercent ?? keepPercent}-${data.compressedSizeBytes ?? Date.now()}`
+        });
+        markSingleSuccess(label);
+    };
+
+    if (!compressedUrl && !originalUrl) {
+        setStatusPhase('完成(预览失败)', 'warn');
+        setProgress('压缩已完成，但没有可加载的预览地址。');
+        return false;
+    }
+
+    const canSplit = Boolean(originalUrl && compressedUrl && !data.skipOriginalPreview && !data.skipCompressedPreview);
+    const previewCacheKey = [
+        data.keepPercent ?? keepPercent,
+        data.compressedCount ?? '',
+        data.compressedSizeBytes ?? '',
+        Date.now()
+    ].join('-');
+
+    try {
+        if (canSplit) {
+            setProgress('正在加载压缩前 / 压缩后对比…');
+            enableCompareView();
+            await loadGsplatUrl(originalUrl, {
+                name: `compare-original-${previewCacheKey}`,
+                unified: true,
+                layers: [compareOriginalLayer.id],
+                frameCamera: true,
+                retries: 3,
+                cacheKey: `${previewCacheKey}-orig`
+            });
+            await loadGsplatUrl(compressedUrl, {
+                name: `compare-compressed-${previewCacheKey}`,
+                unified: true,
+                layers: [compareCompressedLayer.id],
+                frameCamera: false,
+                retries: 3,
+                cacheKey: `${previewCacheKey}-cmp`
+            });
+            markSplitSuccess();
+            return true;
+        }
+
+        const url = compressedUrl || originalUrl;
+        setProgress('文件较大，正在加载单侧预览…');
+        await loadSingle(url, compressedUrl ? '压缩结果预览' : '原始模型预览');
+        setProgress(
+            compressedUrl && data.skipOriginalPreview
+                ? '压缩完成。原始文件过大，当前只显示压缩后模型。刷新后若已生成 SOG 预览即可左右对比。'
+                : '压缩完成，已加载预览。',
+            100
+        );
+        return true;
+    } catch (error) {
+        const fallbackUrl = compressedUrl || originalUrl;
+        try {
+            if (!fallbackUrl) throw error;
+            setProgress(`对比加载失败，改为单模型预览：${error.message || error}`);
+            await loadSingle(fallbackUrl, '单模型预览');
+            setProgress(`未能左右对比（${error.message || error}），已显示压缩结果。`, 100);
+            return true;
+        } catch (fallbackError) {
+            disableCompareView();
+            setStatusPhase('完成(预览失败)', 'warn');
+            setProgress(`预览失败: ${fallbackError.message || fallbackError}。结果文件仍在输出目录中。`);
+            return false;
+        }
     }
 };
 
@@ -625,7 +1037,9 @@ const renderTaskTable = () => {
     if (rows.length === 0) {
         const row = document.createElement('tr');
         row.className = 'border-b border-[#e0e1e6] text-[#60646c]';
-        row.innerHTML = '<td class="px-2 py-2" colspan="3">暂无分块任务。开始转换后会在此显示。</td>';
+        row.innerHTML = currentMode === WORK_MODE.compress
+            ? '<td class="px-2 py-2" colspan="3">暂无压缩任务。开始压缩后会在此显示。</td>'
+            : '<td class="px-2 py-2" colspan="3">暂无分块任务。开始转换后会在此显示。</td>';
         taskTableBodyEl.appendChild(row);
     }
     updateTaskSummary();
@@ -635,8 +1049,9 @@ const setUiRunningState = (running) => {
     startBtn.disabled = running;
     stopBtn.disabled = !running;
     startBtn.setAttribute('aria-busy', running ? 'true' : 'false');
+    const copy = COPY[currentMode] || COPY.lod;
     if (startBtnLabel) {
-        startBtnLabel.textContent = running ? '转换中…' : '开始转换';
+        startBtnLabel.textContent = running ? copy.startBusy : copy.startIdle;
     }
     if (startBtnSpinner) {
         startBtnSpinner.classList.toggle('hidden', !running);
@@ -647,10 +1062,16 @@ const setUiRunningState = (running) => {
         '#outputRoot',
         '#pickInputBtn',
         '#pickOutputBtn',
+        '#downloadOutputBtn',
+        '#importPreviewBtn',
         '#lodCount',
         '#chunkCountK',
         '#levelForm input',
-        '#inputFileHidden'
+        '#inputFileHidden',
+        '#keepPercentRange',
+        '#keepPercentInput',
+        '#modeLodBtn',
+        '#modeCompressBtn'
     ];
     selectors.forEach((selector) => {
         document.querySelectorAll(selector).forEach((el) => {
@@ -664,6 +1085,64 @@ const setUiRunningState = (running) => {
 
     settingsPanelEl.classList.toggle('opacity-60', running);
     settingsPanelEl.classList.toggle('pointer-events-none', running);
+    if (!running) {
+        refreshOutputDownloads();
+    }
+};
+
+const setModeSwitchUi = (mode) => {
+    const isLod = mode !== WORK_MODE.compress;
+    const applyBtn = (btn, active) => {
+        if (!btn) return;
+        btn.classList.toggle('bg-white', active);
+        btn.classList.toggle('text-[#0b5fb9]', active);
+        btn.classList.toggle('text-white/85', !active);
+        btn.classList.toggle('hover:bg-white/10', !active);
+        btn.setAttribute('aria-selected', active ? 'true' : 'false');
+    };
+    applyBtn(modeLodBtn, isLod);
+    applyBtn(modeCompressBtn, !isLod);
+};
+
+const syncKeepPercentUi = (value) => {
+    const next = clamp(Math.round(Number(value) || 60), 1, 99);
+    keepPercent = next;
+    if (keepPercentRange && String(keepPercentRange.value) !== String(next)) {
+        keepPercentRange.value = String(next);
+    }
+    if (keepPercentInput && String(keepPercentInput.value) !== String(next)) {
+        keepPercentInput.value = String(next);
+    }
+    if (keepPercentHint) {
+        keepPercentHint.textContent = `输出约为原始高斯数量的 ${next}%。例如 ${next}% 即压缩到原来的 ${next}%。`;
+    }
+    return next;
+};
+
+const applyWorkMode = (mode, { syncOutput = true } = {}) => {
+    currentMode = mode === WORK_MODE.compress ? WORK_MODE.compress : WORK_MODE.lod;
+    const copy = COPY[currentMode];
+    setModeSwitchUi(currentMode);
+    if (pathDescEl) pathDescEl.innerHTML = currentMode === WORK_MODE.compress
+        ? '指定高斯模型与输出目录。按<strong>保留比例</strong>简化为单个 PLY，不生成分层 LOD。'
+        : '指定高斯模型与输出目录。流水线为<strong>两段式</strong>（中间 PLY → lod-meta）。';
+    if (settingsTitleEl) settingsTitleEl.textContent = copy.settingsTitle;
+    if (settingsDescEl) settingsDescEl.textContent = copy.settingsDesc;
+    if (convertTitleEl) convertTitleEl.textContent = copy.convertTitle;
+    if (convertDescEl) convertDescEl.textContent = copy.convertDesc;
+    lodSettingsBlock?.classList.toggle('hidden', currentMode === WORK_MODE.compress);
+    compressSettingsBlock?.classList.toggle('hidden', currentMode !== WORK_MODE.compress);
+    if (startBtnLabel && startBtn.disabled !== true) {
+        startBtnLabel.textContent = copy.startIdle;
+    } else if (startBtnLabel && startBtn.disabled) {
+        startBtnLabel.textContent = copy.startBusy;
+    }
+    if (syncOutput && inputPathEl.value.trim()) {
+        maybeAutoFillOutput(inputPathEl.value, { force: false });
+    }
+    if (!activeRunId) {
+        setWorkflowStep(inputPathEl.value.trim() && outputRootEl.value.trim() ? 2 : 1);
+    }
 };
 
 const basenameFromPath = (filePath) => {
@@ -702,7 +1181,10 @@ const sanitizeOutputFolderName = (name) => {
 const suggestOutputFromInput = (inputPath) => {
     const base = stripKnownExtension(basenameFromPath(inputPath));
     if (!base) return '';
-    return `output/${sanitizeOutputFolderName(base)}`;
+    const folder = currentMode === WORK_MODE.compress
+        ? `${sanitizeOutputFolderName(base)}-compressed`
+        : sanitizeOutputFolderName(base);
+    return `output/${folder}`;
 };
 
 const updateInputDropHint = (pathValue) => {
@@ -728,6 +1210,7 @@ const maybeAutoFillOutput = (inputPath, { force = false } = {}) => {
     if (shouldUpdate) {
         outputRootEl.value = suggested;
         lastSuggestedOutput = suggested;
+        scheduleRefreshOutputDownloads();
     }
 };
 
@@ -740,6 +1223,74 @@ const setInputPathValue = (value, { autoOutput = true, forceOutput = false } = {
     }
     setWorkflowStep(next && outputRootEl.value.trim() ? 2 : 1);
     saveConfigToStorage();
+    scheduleRefreshOutputDownloads();
+};
+
+let outputDownloadPrimary = null;
+let outputListTimer = null;
+
+const refreshOutputDownloads = async () => {
+    if (!outputRootEl) return;
+    const root = outputRootEl.value.trim();
+    const idle = !activeRunId;
+    if (!root) {
+        outputDownloadPrimary = null;
+        if (downloadOutputBtn) downloadOutputBtn.disabled = true;
+        if (importPreviewBtn) importPreviewBtn.disabled = true;
+        if (downloadOutputHint) downloadOutputHint.textContent = '已有结果可直接导入预览，不必重新转换';
+        return;
+    }
+    try {
+        const res = await fetch(`/api/output-files?root=${encodeURIComponent(root)}`);
+        const data = await res.json();
+        if (!res.ok) {
+            outputDownloadPrimary = null;
+            if (downloadOutputBtn) downloadOutputBtn.disabled = true;
+            if (importPreviewBtn) importPreviewBtn.disabled = true;
+            if (downloadOutputHint) downloadOutputHint.textContent = data.error || '无法读取输出目录';
+            return;
+        }
+        const files = Array.isArray(data.files) ? data.files : [];
+        outputDownloadPrimary = data.primary || null;
+        const canDownload = Boolean(outputDownloadPrimary) && idle;
+        const canPreview = Boolean(data.canPreview) && idle;
+        if (downloadOutputBtn) downloadOutputBtn.disabled = !canDownload;
+        if (importPreviewBtn) importPreviewBtn.disabled = !canPreview;
+        if (!downloadOutputHint) return;
+        if (!data.exists) {
+            downloadOutputHint.textContent = '输出目录还不存在。转换完成后可导入预览或下载';
+            return;
+        }
+        if (data.kind === 'lod') {
+            const levelText = data.lodLevels ? ` · ${data.lodLevels} 层` : '';
+            downloadOutputHint.textContent = `检测到 LOD 结果${levelText}，可导入预览`;
+            return;
+        }
+        if (data.kind === 'compress') {
+            const keepText = data.keepPercent ? ` · 保留 ${data.keepPercent}%` : '';
+            downloadOutputHint.textContent = `检测到压缩结果${keepText}，可导入预览或下载`;
+            return;
+        }
+        if (!outputDownloadPrimary) {
+            downloadOutputHint.textContent = '目录已创建，但还没有可预览的结果文件';
+            return;
+        }
+        const primary = files.find((f) => f.name === outputDownloadPrimary);
+        const sizeText = primary ? `（${formatBytes(primary.sizeBytes)}）` : '';
+        downloadOutputHint.textContent = `可下载 ${outputDownloadPrimary}${sizeText}`;
+    } catch (error) {
+        outputDownloadPrimary = null;
+        if (downloadOutputBtn) downloadOutputBtn.disabled = true;
+        if (importPreviewBtn) importPreviewBtn.disabled = true;
+        if (downloadOutputHint) downloadOutputHint.textContent = `读取输出目录失败: ${error.message || error}`;
+    }
+};
+
+const scheduleRefreshOutputDownloads = () => {
+    clearTimeout(outputListTimer);
+    outputListTimer = setTimeout(() => {
+        refreshOutputDownloads();
+    }, 250);
 };
 
 const resolveDroppedInput = async (fileName, optionalPath = '') => {
@@ -757,12 +1308,85 @@ const resolveDroppedInput = async (fileName, optionalPath = '') => {
 
 const applyResolvedInput = async (fileName, optionalPath = '') => {
     const data = await resolveDroppedInput(fileName, optionalPath);
-    setInputPathValue(data.value, { autoOutput: true, forceOutput: false });
-    if (data.found) {
+    if (data.found && data.value) {
+        setInputPathValue(data.value, { autoOutput: true, forceOutput: false });
         setProgress(`已选择输入：${data.value}`);
     } else {
-        setProgress(data.message || `已填入建议路径：${data.value}`);
+        setProgress(data.message || `未找到文件：${fileName}`);
     }
+    return data;
+};
+
+const fileUrlToPath = (raw) => {
+    let text = `${raw ?? ''}`.trim().replace(/^['"]+|['"]+$/g, '');
+    if (!text) return '';
+    if (/^file:/i.test(text)) {
+        try {
+            const url = new URL(text);
+            let pathname = decodeURIComponent(url.pathname || '');
+            if (/^\/[A-Za-z]:/.test(pathname)) pathname = pathname.slice(1);
+            return pathname.replace(/\//g, '\\');
+        } catch {
+            try {
+                const decoded = decodeURIComponent(text.replace(/^file:\/\//i, ''));
+                return decoded.replace(/^\/([A-Za-z]:)/, '$1').replace(/\//g, '\\');
+            } catch {
+                return text;
+            }
+        }
+    }
+    return text;
+};
+
+const pathLooksAbsolute = (value) => {
+    const text = `${value ?? ''}`.trim();
+    if (!text) return false;
+    if (/^[A-Za-z]:[\\/]/.test(text)) return true;
+    if (text.startsWith('\\\\') || text.startsWith('/')) return true;
+    return false;
+};
+
+const collectDroppedPath = (dt, file = null) => {
+    if (file?.path && pathLooksAbsolute(file.path)) return file.path;
+
+    const fromUriList = `${dt?.getData?.('text/uri-list') ?? ''}`;
+    for (const line of fromUriList.split(/\r?\n/)) {
+        const item = line.trim();
+        if (!item || item.startsWith('#')) continue;
+        const converted = fileUrlToPath(item);
+        if (pathLooksAbsolute(converted) || converted.includes('\\') || converted.includes('/')) {
+            return converted;
+        }
+    }
+
+    const plain = `${dt?.getData?.('text/plain') ?? ''}`.trim();
+    if (plain) {
+        const converted = fileUrlToPath(plain);
+        if (pathLooksAbsolute(converted) || converted.includes('\\') || converted.includes('/')) {
+            return converted;
+        }
+    }
+    return '';
+};
+
+const uploadDroppedFile = async (file) => {
+    const name = file.name || 'upload.ply';
+    const sizeHint = Number.isFinite(file.size) ? `（${formatBytes(file.size)}）` : '';
+    setProgress(`正在导入 ${name}${sizeHint} 到 input/ …`);
+    const res = await fetch(`/api/upload-input?name=${encodeURIComponent(name)}`, {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/octet-stream',
+            'X-File-Name': encodeURIComponent(name)
+        },
+        body: file
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+        throw new Error(data.error || '导入文件失败');
+    }
+    setInputPathValue(data.value, { autoOutput: true, forceOutput: false });
+    setProgress(`已导入到 ${data.value}，可开始转换。`);
     return data;
 };
 
@@ -865,6 +1489,8 @@ const saveConfigToStorage = () => {
             ? collectLevelsFromUi()
             : levelState;
         const payload = {
+            mode: currentMode,
+            keepPercent,
             inputPath: inputPathEl.value.trim(),
             outputRoot: outputRootEl.value.trim(),
             lodCount: Number(lodCountEl.value) || levels.length,
@@ -889,6 +1515,12 @@ const loadConfigFromStorage = () => {
 
 const applyConfigToForm = (cfg) => {
     if (!cfg) return;
+    if (cfg.keepPercent != null) {
+        syncKeepPercentUi(cfg.keepPercent);
+    }
+    if (cfg.mode === WORK_MODE.compress || cfg.mode === WORK_MODE.lod) {
+        applyWorkMode(cfg.mode, { syncOutput: false });
+    }
     if (cfg.inputPath) {
         inputPathEl.value = cfg.inputPath;
         updateInputDropHint(cfg.inputPath);
@@ -944,6 +1576,12 @@ const applyRunSnapshot = async (snapshot, { fromRefresh = false } = {}) => {
         if (chunkCountKEl && snapshot.chunkCountK) {
             chunkCountKEl.value = String(snapshot.chunkCountK);
         }
+        if (snapshot.mode === WORK_MODE.compress || snapshot.mode === WORK_MODE.lod) {
+            applyWorkMode(snapshot.mode, { syncOutput: false });
+        }
+        if (snapshot.keepPercent != null) {
+            syncKeepPercentUi(snapshot.keepPercent);
+        }
         if (Array.isArray(snapshot.levels) && snapshot.levels.length > 0) {
             levelState = snapshot.levels.map((level) => ({
                 ...level,
@@ -985,7 +1623,10 @@ const applyRunSnapshot = async (snapshot, { fromRefresh = false } = {}) => {
         if (status === 'running' || snapshot.active) {
             setUiRunningState(true);
             setWorkflowStep(3);
-            if (pipelinePhase === 1) {
+            if (snapshot.mode === WORK_MODE.compress) {
+                setStatusPhase('压缩中', 'run');
+                setViewMode(fromRefresh ? '已恢复 · 压缩进行中' : '模型压缩');
+            } else if (pipelinePhase === 1) {
                 setStatusPhase('阶段1 简化', 'run');
                 setViewMode(fromRefresh ? '已恢复 · 阶段1 进行中' : '阶段1 · 生成中间文件');
             } else if (pipelinePhase === 2) {
@@ -1007,9 +1648,26 @@ const applyRunSnapshot = async (snapshot, { fromRefresh = false } = {}) => {
             setWorkflowStep(4);
             setStatusPhase('完成', 'ok');
             setProgress(snapshot.lastLine || '上次转换已完成。', 100);
-            setViewMode('可加载最终 lod-meta');
-            if (snapshot.outputMetaUrl) {
-                await loadFinalLodMeta(snapshot.outputMetaUrl);
+            if (snapshot.mode === WORK_MODE.compress) {
+                setViewMode('可加载压缩对比预览');
+                if (snapshot.compressedPreviewUrl || snapshot.originalPreviewUrl) {
+                    await loadComparePreview({
+                        originalUrl: snapshot.originalPreviewUrl,
+                        compressedUrl: snapshot.compressedPreviewUrl,
+                        keepPercent: snapshot.keepPercent,
+                        originalSizeBytes: snapshot.originalSizeBytes,
+                        compressedSizeBytes: snapshot.compressedSizeBytes,
+                        originalCount: snapshot.originalCount,
+                        compressedCount: snapshot.compressedCount,
+                        skipOriginalPreview: snapshot.skipOriginalPreview,
+                        skipCompressedPreview: snapshot.skipCompressedPreview
+                    });
+                }
+            } else {
+                setViewMode('可加载最终 lod-meta');
+                if (snapshot.outputMetaUrl) {
+                    await loadFinalLodMeta(snapshot.outputMetaUrl);
+                }
             }
         } else if (status === 'stopped') {
             setUiRunningState(false);
@@ -1043,6 +1701,7 @@ eventSource.addEventListener('run-start', (evt) => {
     currentLod = null;
     currentChunkName = null;
     finalLodMetaUrl = data.outputMetaUrl || null;
+    lastComparePayload = null;
     showingFinalLod = false;
     pipelinePhase = 0;
     previewMode = PREVIEW_MODE.none;
@@ -1051,6 +1710,12 @@ eventSource.addEventListener('run-start', (evt) => {
     pendingChunkLoads.clear();
     isChunkLoadPumping = false;
     clearCurrentLevelRender();
+    if (data.mode === WORK_MODE.compress || data.mode === WORK_MODE.lod) {
+        applyWorkMode(data.mode, { syncOutput: false });
+    }
+    if (data.keepPercent != null) {
+        syncKeepPercentUi(data.keepPercent);
+    }
     ((data.levels || []).map((item) => Number(item.lod)).filter((lod) => Number.isFinite(lod))).forEach((lod) => {
         levelChunkQueue.set(lod, new Map());
     });
@@ -1070,9 +1735,15 @@ eventSource.addEventListener('run-start', (evt) => {
     resetCameraHome();
     setUiRunningState(true);
     setWorkflowStep(3);
-    setStatusPhase('转换中', 'run');
-    setViewMode('两段式流水线');
-    setProgress('转换已开始：阶段1 简化 → 阶段2 合成 lod-meta', 0);
+    if (currentMode === WORK_MODE.compress) {
+        setStatusPhase('压缩中', 'run');
+        setViewMode('模型压缩');
+        setProgress(`压缩已开始：保留 ${keepPercent}% 高斯`, 0);
+    } else {
+        setStatusPhase('转换中', 'run');
+        setViewMode('两段式流水线');
+        setProgress('转换已开始：阶段1 简化 → 阶段2 合成 lod-meta', 0);
+    }
 });
 
 eventSource.addEventListener('phase-start', (evt) => {
@@ -1080,9 +1751,15 @@ eventSource.addEventListener('phase-start', (evt) => {
     if (activeRunId && data.runId !== activeRunId) return;
     pipelinePhase = Number(data.phase) || 0;
     if (pipelinePhase === 1) {
-        setStatusPhase('阶段1 简化', 'run');
-        setViewMode('阶段1 · 生成中间文件');
-        setProgress(data.title || '阶段 1：串行生成各层中间简化文件…');
+        if (currentMode === WORK_MODE.compress) {
+            setStatusPhase('压缩中', 'run');
+            setViewMode('正在简化模型');
+            setProgress(data.title || `正在压缩（保留 ${keepPercent}%）…`);
+        } else {
+            setStatusPhase('阶段1 简化', 'run');
+            setViewMode('阶段1 · 生成中间文件');
+            setProgress(data.title || '阶段 1：串行生成各层中间简化文件…');
+        }
     } else if (pipelinePhase === 2) {
         // Leave intermediate scene until first chunk; then switch
         setStatusPhase('阶段2 合成', 'run');
@@ -1100,7 +1777,11 @@ eventSource.addEventListener('phase-complete', (evt) => {
     const data = JSON.parse(evt.data);
     if (activeRunId && data.runId !== activeRunId) return;
     if (Number(data.phase) === 1) {
-        setProgress('阶段1 完成，开始合成 lod-meta…', data.percent ?? null);
+        if (currentMode === WORK_MODE.compress) {
+            setProgress('压缩完成，准备对比预览…', data.percent ?? 100);
+        } else {
+            setProgress('阶段1 完成，开始合成 lod-meta…', data.percent ?? null);
+        }
     } else if (Number(data.phase) === 2) {
         setProgress('阶段2 完成，准备加载最终分层结果…', data.percent ?? 100);
     }
@@ -1123,6 +1804,46 @@ eventSource.addEventListener('intermediate-start', (evt) => {
     renderTaskTable();
     setViewMode(`阶段1 简化中 · L${data.lod}（${data.index}/${data.total}）`);
     setProgress(`阶段1 [${data.index}/${data.total}] 正在简化 L${data.lod}（保留 ${data.decimate || '?'}）…`);
+});
+
+eventSource.addEventListener('compress-plan', (evt) => {
+    const data = JSON.parse(evt.data);
+    if (activeRunId && data.runId !== activeRunId) return;
+    const name = data.taskName || '压缩输出';
+    setChunkTaskStatus(name, name === '原模型' ? '已计算' : '待计算', name === '原模型' ? 100 : 0);
+    renderTaskTable();
+});
+
+eventSource.addEventListener('compress-original-ready', (evt) => {
+    const data = JSON.parse(evt.data);
+    if (activeRunId && data.runId !== activeRunId) return;
+    setChunkTaskStatus(data.taskName || '原模型', '已计算', 100);
+    renderTaskTable();
+});
+
+eventSource.addEventListener('compress-start', (evt) => {
+    const data = JSON.parse(evt.data);
+    if (activeRunId && data.runId !== activeRunId) return;
+    pipelinePhase = 1;
+    currentLodEl.textContent = `${data.keepPercent ?? keepPercent}%`;
+    setChunkTaskStatus(data.taskName || '压缩输出', '正在计算', 5);
+    renderTaskTable();
+    setViewMode(`压缩中 · 保留 ${data.keepPercent ?? keepPercent}%`);
+    setProgress(`正在简化模型（保留 ${data.decimate || `${data.keepPercent}%`}）…`);
+});
+
+eventSource.addEventListener('compress-ready', (evt) => {
+    const data = JSON.parse(evt.data);
+    if (activeRunId && data.runId !== activeRunId) return;
+    lastComparePayload = data;
+    setChunkTaskStatus('压缩输出', '已计算', 100);
+    renderTaskTable();
+    currentLodEl.textContent = `${data.keepPercent ?? keepPercent}%`;
+    updateCompareLabels(data);
+    const sizeLine = (data.originalSizeBytes != null && data.compressedSizeBytes != null)
+        ? ` ${formatBytes(data.originalSizeBytes)} → ${formatBytes(data.compressedSizeBytes)}`
+        : '';
+    setProgress(`压缩结果已写出${sizeLine}，准备对比预览…`);
 });
 
 eventSource.addEventListener('intermediate-ready', (evt) => {
@@ -1239,6 +1960,12 @@ eventSource.addEventListener('progress', (evt) => {
     if (progressChunkName && data.chunkPercent != null) {
         setChunkTaskProgress(progressChunkName, Math.min(99, Number(data.chunkPercent)), '正在计算');
         renderTaskTable();
+    } else if (currentMode === WORK_MODE.compress && data.percent != null) {
+        const task = chunkTasks.get('压缩输出');
+        if (task && task.status !== '已计算') {
+            setChunkTaskProgress('压缩输出', Math.min(99, Number(data.percent)), '正在计算');
+            renderTaskTable();
+        }
     }
     setProgress(data.line, data.percent);
 });
@@ -1279,17 +2006,45 @@ eventSource.addEventListener('run-complete', async (evt) => {
     setWorkflowStep(4);
     setStatusPhase('加载预览', 'run');
 
+    const outHint = outputRootEl.value.trim() || '输出目录';
+    const completedRunId = activeRunId;
+    const isCompress = data.mode === WORK_MODE.compress || currentMode === WORK_MODE.compress;
+
+    if (isCompress) {
+        const comparePayload = {
+            originalUrl: data.originalUrl || lastComparePayload?.originalUrl,
+            compressedUrl: data.compressedUrl || lastComparePayload?.compressedUrl,
+            keepPercent: data.keepPercent ?? lastComparePayload?.keepPercent ?? keepPercent,
+            originalSizeBytes: data.originalSizeBytes ?? lastComparePayload?.originalSizeBytes,
+            compressedSizeBytes: data.compressedSizeBytes ?? lastComparePayload?.compressedSizeBytes,
+            originalCount: data.originalCount ?? lastComparePayload?.originalCount,
+            compressedCount: data.compressedCount ?? lastComparePayload?.compressedCount,
+            skipOriginalPreview: data.skipOriginalPreview ?? false,
+            skipCompressedPreview: data.skipCompressedPreview ?? false
+        };
+        lastComparePayload = comparePayload;
+        setProgress(`压缩完成，正在加载对比预览… 输出：${outHint}`, 100);
+        const loaded = await loadComparePreview(comparePayload);
+        if (activeRunId === completedRunId) {
+            activeRunId = null;
+        }
+        refreshOutputDownloads();
+        if (!loaded) {
+            setStatusPhase('完成(预览失败)', 'warn');
+        }
+        return;
+    }
+
     const metaUrl = data.outputMetaUrl || finalLodMetaUrl;
     finalLodMetaUrl = metaUrl;
-    const outHint = outputRootEl.value.trim() || '输出目录';
     setProgress(`计算完成，正在加载分层结果… 输出：${outHint}`, 100);
 
     // Keep runId until final load finishes so late chunk-ready events still match
-    const completedRunId = activeRunId;
     const loaded = await loadFinalLodMeta(metaUrl);
     if (activeRunId === completedRunId) {
         activeRunId = null;
     }
+    refreshOutputDownloads();
     if (!loaded) {
         setStatusPhase('完成(预览失败)', 'warn');
         setProgress(`文件已写出到「${outHint}」，但视口预览失败。可检查 lod-meta.json。`, 100);
@@ -1308,6 +2063,7 @@ eventSource.addEventListener('run-error', (evt) => {
     setUiRunningState(false);
     activeRunId = null;
     currentChunkName = null;
+    refreshOutputDownloads();
     setWorkflowStep(2);
     setStatusPhase('失败', 'err');
     setViewMode('转换失败');
@@ -1324,6 +2080,7 @@ eventSource.addEventListener('run-stopped', (evt) => {
     currentChunkName = null;
     activeRunId = null;
     setUiRunningState(false);
+    refreshOutputDownloads();
     setWorkflowStep(2);
     setStatusPhase('已停止', 'warn');
     setViewMode('已停止');
@@ -1427,6 +2184,8 @@ const initializeDefaults = async () => {
     if (chunkCountKEl) {
         chunkCountKEl.value = String(Math.max(1, Number(defaults.chunkCountK) || defaults.levels?.[0]?.chunkCountK || 512));
     }
+    syncKeepPercentUi(defaults.keepPercent || 60);
+    applyWorkMode(defaults.mode === WORK_MODE.compress ? WORK_MODE.compress : WORK_MODE.lod, { syncOutput: false });
     levelState = defaults.levels
         .map((level) => ({
             ...level,
@@ -1460,6 +2219,7 @@ const initializeDefaults = async () => {
     } catch (error) {
         setProgress(`恢复任务状态失败: ${error.message || error}`);
     }
+    refreshOutputDownloads();
 };
 
 const pickPath = async (kind) => {
@@ -1496,6 +2256,23 @@ const validateBeforeStart = () => {
         return null;
     }
 
+    if (currentMode === WORK_MODE.compress) {
+        const keep = syncKeepPercentUi(keepPercentInput?.value || keepPercentRange?.value || keepPercent);
+        if (keep < 1 || keep > 99) {
+            setProgress('保留比例需在 1%–99% 之间。');
+            setWorkflowStep(2);
+            setStatusPhase('参数无效', 'warn');
+            return null;
+        }
+        return {
+            mode: WORK_MODE.compress,
+            inputPath,
+            outputRoot,
+            keepPercent: keep,
+            resume: true
+        };
+    }
+
     const latestCount = normalizeLodCountInput();
     if (latestCount !== levelState.length) {
         rebuildLevelsByCount(latestCount);
@@ -1523,6 +2300,7 @@ const validateBeforeStart = () => {
     if (chunkCountKEl) chunkCountKEl.value = String(chunkCountK);
 
     return {
+        mode: WORK_MODE.lod,
         inputPath,
         outputRoot,
         levels: levelState,
@@ -1538,20 +2316,28 @@ startBtn.addEventListener('click', async () => {
 
     saveConfigToStorage();
     setWorkflowStep(3);
+    setUiRunningState(true);
     setStatusPhase('启动中', 'run');
-    setProgress('正在启动转换…', 0);
+    setProgress(currentMode === WORK_MODE.compress ? '正在启动压缩…' : '正在启动转换…', 0);
 
-    const res = await fetch('/api/start', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
-    });
-    const data = await res.json();
-    if (!res.ok) {
+    try {
+        const res = await fetch('/api/start', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+        });
+        const data = await res.json();
+        if (!res.ok) {
+            setUiRunningState(false);
+            setWorkflowStep(2);
+            setStatusPhase('启动失败', 'err');
+            setProgress(`启动失败: ${data.error || '未知错误'}`);
+        }
+    } catch (error) {
         setUiRunningState(false);
         setWorkflowStep(2);
         setStatusPhase('启动失败', 'err');
-        setProgress(`启动失败: ${data.error || '未知错误'}`);
+        setProgress(`启动失败: ${error.message || error}`);
     }
 });
 
@@ -1580,6 +2366,7 @@ pickOutputBtn.addEventListener('click', async () => {
             setWorkflowStep(inputPathEl.value.trim() && outputRootEl.value.trim() ? 2 : 1);
             saveConfigToStorage();
             setProgress(`已选择输出：${value}`);
+            scheduleRefreshOutputDownloads();
         }
     } catch (error) {
         setProgress(`选择输出目录失败: ${error.message || error}`);
@@ -1618,6 +2405,7 @@ outputRootEl.addEventListener('input', () => {
     }
     setWorkflowStep(inputPathEl.value.trim() && current ? 2 : 1);
     saveConfigToStorage();
+    scheduleRefreshOutputDownloads();
 });
 
 inputPathEl.addEventListener('change', () => {
@@ -1625,7 +2413,94 @@ inputPathEl.addEventListener('change', () => {
     maybeAutoFillOutput(inputPathEl.value, { force: false });
     saveConfigToStorage();
 });
-outputRootEl.addEventListener('change', saveConfigToStorage);
+outputRootEl.addEventListener('change', () => {
+    saveConfigToStorage();
+    scheduleRefreshOutputDownloads();
+});
+
+const importExistingOutput = async () => {
+    if (activeRunId) {
+        setProgress('请先等待当前任务结束，再导入预览。');
+        return;
+    }
+    const root = outputRootEl.value.trim();
+    if (!root) {
+        setProgress('请先填写或选择已有输出目录。');
+        setWorkflowStep(1);
+        return;
+    }
+
+    setStatusPhase('导入中', 'run');
+    setProgress('正在导入已有结果…');
+    if (importPreviewBtn) importPreviewBtn.disabled = true;
+
+    try {
+        const res = await fetch('/api/open-output', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ outputRoot: root })
+        });
+        const data = await res.json();
+        if (!res.ok) {
+            throw new Error(data.error || '导入失败');
+        }
+
+        if (data.kind === 'lod') {
+            applyWorkMode(WORK_MODE.lod, { syncOutput: false });
+            if (Number(data.lodLevels) > 0) {
+                rebuildLevelsByCount(Number(data.lodLevels));
+            }
+            setWorkflowStep(4);
+            const loaded = await loadFinalLodMeta(data.outputMetaUrl);
+            if (loaded) {
+                setProgress(`已导入 LOD 预览：${root}`, 100);
+            }
+            return;
+        }
+
+        if (data.kind === 'compress') {
+            applyWorkMode(WORK_MODE.compress, { syncOutput: false });
+            if (data.keepPercent != null) syncKeepPercentUi(data.keepPercent);
+            setWorkflowStep(4);
+            const loaded = await loadComparePreview(data);
+            if (loaded) {
+                setProgress(`已导入压缩对比预览：${root}`, 100);
+            }
+            return;
+        }
+
+        throw new Error('未识别的输出类型。');
+    } catch (error) {
+        setStatusPhase('导入失败', 'err');
+        setProgress(`导入预览失败: ${error.message || error}`);
+    } finally {
+        refreshOutputDownloads();
+    }
+};
+
+if (importPreviewBtn) {
+    importPreviewBtn.addEventListener('click', () => {
+        importExistingOutput();
+    });
+}
+
+if (downloadOutputBtn) {
+    downloadOutputBtn.addEventListener('click', () => {
+        const root = outputRootEl.value.trim();
+        if (!root || !outputDownloadPrimary) {
+            setProgress('还没有可下载的结果文件。');
+            return;
+        }
+        const url = `/api/download-output?root=${encodeURIComponent(root)}&name=${encodeURIComponent(outputDownloadPrimary)}`;
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = outputDownloadPrimary;
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        setProgress(`开始下载 ${outputDownloadPrimary}…`);
+    });
+}
 
 // --- Input drag & drop ---
 const setDropZoneActive = (active) => {
@@ -1641,17 +2516,26 @@ const isAcceptedInputName = (name) => {
     return INPUT_EXTS.some((ext) => lower.endsWith(ext));
 };
 
-const handleDroppedFile = async (file) => {
+const handleDroppedFile = async (file, dt = null) => {
     if (!file) return;
     const name = file.name || '';
     if (!isAcceptedInputName(name)) {
         setProgress(`不支持的文件类型：${name || '(未知)'}，请使用 .ply / .sog 等`);
         return;
     }
-    // Electron / some hosts expose full path; browsers usually do not
-    const fullPath = file.path || file.webkitRelativePath || '';
+
     try {
-        await applyResolvedInput(name, fullPath);
+        const realPath = collectDroppedPath(dt, file);
+        if (realPath) {
+            const data = await resolveDroppedInput(name, realPath);
+            if (data.found && data.value) {
+                setInputPathValue(data.value, { autoOutput: true, forceOutput: false });
+                setProgress(`已选择输入：${data.value}`);
+                return;
+            }
+        }
+        // Browser did not expose a usable OS path: copy into workspace input/
+        await uploadDroppedFile(file);
     } catch (error) {
         setProgress(`导入失败: ${error.message || error}`);
     }
@@ -1678,22 +2562,20 @@ if (inputDropZone) {
         const dt = e.dataTransfer;
         if (!dt) return;
 
-        // Text path paste-drop (user dragged path text)
-        const text = dt.getData('text/plain')?.trim();
-        if (text && (text.includes('/') || text.includes('\\') || text.includes(':'))) {
-            const base = basenameFromPath(text);
-            try {
-                await applyResolvedInput(base || text, text);
-            } catch (error) {
-                setInputPathValue(text, { autoOutput: true });
-                setProgress(`已填入路径：${text}`);
-            }
+        const file = dt.files?.[0];
+        if (file) {
+            await handleDroppedFile(file, dt);
             return;
         }
 
-        const file = dt.files?.[0];
-        if (file) {
-            await handleDroppedFile(file);
+        const droppedPath = collectDroppedPath(dt, null);
+        if (droppedPath) {
+            const base = basenameFromPath(droppedPath);
+            try {
+                await applyResolvedInput(base || droppedPath, droppedPath);
+            } catch (error) {
+                setProgress(`导入失败: ${error.message || error}`);
+            }
             return;
         }
         setProgress('未识别到可导入的文件，请重试或使用浏览按钮。');
@@ -1764,6 +2646,77 @@ lodCountEl.addEventListener('input', () => {
     saveConfigToStorage();
 });
 
+const onKeepPercentChange = (value) => {
+    syncKeepPercentUi(value);
+    if (!activeRunId) setWorkflowStep(2);
+    saveConfigToStorage();
+};
+
+if (keepPercentRange) {
+    keepPercentRange.addEventListener('input', () => onKeepPercentChange(keepPercentRange.value));
+}
+if (keepPercentInput) {
+    keepPercentInput.addEventListener('input', () => onKeepPercentChange(keepPercentInput.value));
+    keepPercentInput.addEventListener('keydown', (e) => {
+        if (e.key === 'e' || e.key === 'E' || e.key === '+' || e.key === '-') {
+            e.preventDefault();
+        }
+    });
+}
+
+const setWorkModeFromUi = (mode) => {
+    if (activeRunId) return;
+    if (mode === currentMode) return;
+    applyWorkMode(mode, { syncOutput: true });
+    saveConfigToStorage();
+    setProgress(currentMode === WORK_MODE.compress
+        ? '已切换到模型压缩：设置保留比例后开始压缩。'
+        : '已切换到 LOD 转换：设置层数与保留率后开始转换。');
+    setStatusPhase('就绪', 'idle');
+};
+
+if (modeLodBtn) {
+    modeLodBtn.addEventListener('click', () => setWorkModeFromUi(WORK_MODE.lod));
+}
+if (modeCompressBtn) {
+    modeCompressBtn.addEventListener('click', () => setWorkModeFromUi(WORK_MODE.compress));
+}
+
+const previewSectionEl = canvas?.closest('section') || canvas?.parentElement;
+
+const splitFromClientX = (clientX) => {
+    const rect = (previewSectionEl || canvas).getBoundingClientRect();
+    if (!rect.width) return compareSplit;
+    return (clientX - rect.left) / rect.width;
+};
+
+if (compareDivider) {
+    compareDivider.addEventListener('pointerdown', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        isDraggingSplit = true;
+        isLeftDown = false;
+        isRightDown = false;
+        compareDivider.setPointerCapture(e.pointerId);
+        applyCompareSplit(splitFromClientX(e.clientX));
+    });
+    compareDivider.addEventListener('pointermove', (e) => {
+        if (!isDraggingSplit) return;
+        applyCompareSplit(splitFromClientX(e.clientX));
+    });
+    const endSplitDrag = (e) => {
+        if (!isDraggingSplit) return;
+        isDraggingSplit = false;
+        try {
+            compareDivider.releasePointerCapture(e.pointerId);
+        } catch {
+            // already released
+        }
+    };
+    compareDivider.addEventListener('pointerup', endSplitDrag);
+    compareDivider.addEventListener('pointercancel', endSplitDrag);
+}
+
 if (resetCameraBtn) {
     resetCameraBtn.addEventListener('click', () => {
         // Prefer framing loaded content; fall back to origin home view
@@ -1778,6 +2731,39 @@ if (resetCameraBtn) {
         else syncCameraClipPlanes();
         setProgress(framed ? '视角已对准模型。' : '视角已重置。');
     });
+}
+
+if (lodDebugBtn && lodDebugPanel) {
+    lodDebugBtn.addEventListener('click', () => {
+        const willShow = lodDebugPanel.classList.contains('hidden');
+        lodDebugPanel.classList.toggle('hidden', !willShow);
+        if (willShow) {
+            populateLodIsolateSelect();
+            renderLodColorLegend();
+            applyLodDebugSettings();
+        }
+    });
+}
+if (lodColorizeToggle) {
+    lodColorizeToggle.addEventListener('change', () => {
+        applyLodDebugSettings();
+        setProgress(lodColorizeToggle.checked
+            ? '已开启 LOD 层级着色。不同颜色对应不同层。'
+            : '已关闭层级着色，恢复真实颜色。');
+    });
+}
+if (lodIsolateSelect) {
+    lodIsolateSelect.addEventListener('change', () => {
+        applyLodDebugSettings();
+        const v = lodIsolateSelect.value;
+        setProgress(v === 'all' ? '显示全部 LOD（按距离自动切换）。' : `仅显示 L${v}。`);
+    });
+}
+if (lodBaseDistanceRange) {
+    lodBaseDistanceRange.addEventListener('input', applyLodDebugSettings);
+}
+if (lodMultiplierRange) {
+    lodMultiplierRange.addEventListener('input', applyLodDebugSettings);
 }
 
 const closeHelp = () => setHelpOpen(false);

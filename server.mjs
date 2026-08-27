@@ -1,8 +1,9 @@
 import { spawn } from 'node:child_process';
-import { createReadStream, existsSync } from 'node:fs';
-import { access, mkdir, readFile, readdir, rm, stat } from 'node:fs/promises';
+import { createReadStream, createWriteStream, existsSync } from 'node:fs';
+import { access, mkdir, open, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import http from 'node:http';
 import path from 'node:path';
+import { pipeline } from 'node:stream/promises';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 
@@ -76,6 +77,13 @@ const DEFAULT_LEVELS = [
     { lod: 0, decimate: '', chunkCountK: 512 }
 ];
 
+/** Compress-only mode: keep this fraction of Gaussians (1–99). */
+const DEFAULT_KEEP_PERCENT = 60;
+const COMPRESS_FILENAME = 'compressed.ply';
+const COMPRESS_META_FILENAME = 'compress-meta.json';
+const PREVIEW_ORIGINAL_SOG = 'preview-original.sog';
+const PREVIEW_COMPRESSED_SOG = 'preview-compressed.sog';
+
 const sseClients = new Set();
 let activeRun = null;
 /** Last finished/stopped run snapshot (for refresh after complete) */
@@ -114,6 +122,39 @@ const normalizeRelPath = (targetPath) => {
         throw new Error('Path must stay inside repository.');
     }
     return { resolved, rel: rel.replaceAll('\\', '/') };
+};
+
+const INPUT_UPLOAD_EXTS = ['.ply', '.sog', '.splat', '.spz', '.ksplat'];
+
+const isAcceptedInputFileName = (fileName) => {
+    const lower = `${fileName ?? ''}`.toLowerCase();
+    if (lower.endsWith('.compressed.ply')) return true;
+    return INPUT_UPLOAD_EXTS.some((ext) => lower.endsWith(ext));
+};
+
+const sanitizeUploadFileName = (fileName) => {
+    const base = path.basename(`${fileName ?? ''}`.trim() || 'upload.ply');
+    const cleaned = base.replace(/[<>:"/\\|?*\u0000-\u001f]/g, '_');
+    return cleaned || 'upload.ply';
+};
+
+/** Accept Windows paths, POSIX paths, and file:/// URLs from Explorer drag-drop. */
+const normalizeDroppedPath = (raw) => {
+    let text = `${raw ?? ''}`.trim().replace(/^['"]+|['"]+$/g, '');
+    if (!text) return '';
+    if (text.startsWith('file:')) {
+        try {
+            return fileURLToPath(text);
+        } catch {
+            try {
+                const decoded = decodeURIComponent(text.replace(/^file:\/\//i, ''));
+                return decoded.replace(/^\/([A-Za-z]:)/, '$1');
+            } catch {
+                return text;
+            }
+        }
+    }
+    return text;
 };
 
 const isPathInside = (filePath, rootPath) => {
@@ -213,6 +254,16 @@ const reconcileTasksFromDisk = async (runState) => {
         trackTask(runState, 'L0 原文件', { progress: 100, status: '已计算' }, { force: true });
     }
 
+    if (runState.mode === 'compress') {
+        trackTask(runState, '原模型', { progress: 100, status: '已计算' }, { force: true });
+        const compressedName = runState.compressedFileName || COMPRESS_FILENAME;
+        const compressedPath = path.join(root, compressedName);
+        const compressedStat = await stat(compressedPath).catch(() => null);
+        if (compressedStat?.isFile() && compressedStat.size > 64) {
+            trackTask(runState, '压缩输出', { progress: 100, status: '已计算' }, { force: true });
+        }
+    }
+
     if (runState.finished && !runState.cancelled && !runState.errorMessage) {
         markAllTasksDone(runState);
     }
@@ -296,10 +347,36 @@ const trackRunEvent = (runState, event, payload) => {
                 }
             }
             break;
+        case 'compress-plan':
+            trackTask(runState, payload.taskName || '压缩输出', {
+                progress: payload.taskName === '原模型' ? 100 : 0,
+                status: payload.taskName === '原模型' ? '已计算' : '待计算'
+            });
+            break;
+        case 'compress-start':
+            trackTask(runState, payload.taskName || '压缩输出', {
+                progress: 5,
+                status: '正在计算'
+            });
+            runState.lastLine = `正在压缩（保留 ${payload.keepPercent ?? '?'}%）`;
+            break;
+        case 'compress-ready':
+            trackTask(runState, '压缩输出', {
+                progress: 100,
+                status: '已计算'
+            }, { force: true });
+            if (payload.keepPercent != null) runState.keepPercent = payload.keepPercent;
+            if (payload.originalUrl) runState.originalPreviewUrl = payload.originalUrl;
+            if (payload.compressedUrl) runState.compressedPreviewUrl = payload.compressedUrl;
+            if (payload.originalSizeBytes != null) runState.originalSizeBytes = payload.originalSizeBytes;
+            if (payload.compressedSizeBytes != null) runState.compressedSizeBytes = payload.compressedSizeBytes;
+            if (payload.originalCount != null) runState.originalCount = payload.originalCount;
+            if (payload.compressedCount != null) runState.compressedCount = payload.compressedCount;
+            break;
         case 'run-complete':
             runState.finished = true;
             runState.lastPercent = 100;
-            runState.lastLine = '全部 LOD 计算完成。';
+            runState.lastLine = runState.mode === 'compress' ? '模型压缩完成。' : '全部 LOD 计算完成。';
             markAllTasksDone(runState);
             break;
         case 'run-error':
@@ -320,6 +397,9 @@ const trackRunEvent = (runState, event, payload) => {
 const getRunSnapshot = async (runState) => {
     if (!runState) return null;
     await reconcileTasksFromDisk(runState);
+    if (runState.mode === 'compress') {
+        await applyCompressPreviewUrls(runState);
+    }
     const isActive = activeRun?.runId === runState.runId && !runState.finished;
     return {
         runId: runState.runId,
@@ -342,7 +422,7 @@ const getRunSnapshot = async (runState) => {
         lastLine: runState.lastLine || '',
         currentLod: runState.currentLod,
         currentChunkName: runState.currentChunkName,
-        outputMetaUrl: makeOutUrl(runState.runId, 'lod-meta.json'),
+        outputMetaUrl: runState.mode === 'compress' ? null : makeOutUrl(runState.runId, 'lod-meta.json'),
         intermediateDir: INTERMEDIATE_DIR,
         intermediateAbsDir: runState.outputRootAbsPath
             ? path.join(runState.outputRootAbsPath, INTERMEDIATE_DIR)
@@ -355,7 +435,17 @@ const getRunSnapshot = async (runState) => {
             }))
             : [],
         errorMessage: runState.errorMessage || null,
-        pipeline: 'two-phase'
+        pipeline: runState.mode === 'compress' ? 'compress' : 'two-phase',
+        mode: runState.mode || 'lod',
+        keepPercent: runState.keepPercent ?? null,
+        originalPreviewUrl: runState.originalPreviewUrl || null,
+        compressedPreviewUrl: runState.compressedPreviewUrl || null,
+        originalSizeBytes: runState.originalSizeBytes ?? null,
+        compressedSizeBytes: runState.compressedSizeBytes ?? null,
+        originalCount: runState.originalCount ?? null,
+        compressedCount: runState.compressedCount ?? null,
+        skipOriginalPreview: runState.skipOriginalPreview ?? false,
+        skipCompressedPreview: runState.skipCompressedPreview ?? false
     };
 };
 
@@ -363,6 +453,37 @@ const registerServedFile = (absPath) => {
     const id = `f${fileIdCounter++}`;
     fileRegistry.set(id, absPath);
     return `/file/${id}`;
+};
+
+/**
+ * Serve an input model for 3D preview: repo-relative via /repo, otherwise a tokenized /file URL.
+ */
+const makeInputPreviewUrl = (absPath) => {
+    const resolved = path.resolve(absPath);
+    try {
+        const rel = path.relative(repoRoot, resolved).replaceAll('\\', '/');
+        if (rel && !rel.startsWith('..') && !path.isAbsolute(rel)) {
+            return `/repo/${rel.split('/').map((part) => encodeURIComponent(part)).join('/')}`;
+        }
+    } catch {
+        // fall through to token URL
+    }
+    return registerServedFile(resolved);
+};
+
+const clampKeepPercent = (value) => {
+    const n = Number(value);
+    if (!Number.isFinite(n)) return DEFAULT_KEEP_PERCENT;
+    return Math.max(1, Math.min(99, Math.round(n)));
+};
+
+const readCompressMeta = async (metaPath) => {
+    try {
+        const parsed = JSON.parse(await readFile(metaPath, 'utf-8'));
+        return parsed && typeof parsed === 'object' ? parsed : null;
+    } catch {
+        return null;
+    }
 };
 
 const safeReadDir = async (dirPath) => {
@@ -665,6 +786,24 @@ const streamLines = (stream, runState, type) => {
                         chunkName: candidate
                     });
                 }
+            }
+
+            const loadedMatch = line.match(/Total gaussians loaded:\s*([\d,]+)/i);
+            if (loadedMatch) {
+                const n = Number(loadedMatch[1].replace(/,/g, ''));
+                if (Number.isFinite(n)) runState.originalCount = n;
+            }
+            const reduceMatch = line.match(/simplifyGaussians:\s*reducing\s+([\d,]+)\s*→\s*([\d,]+)/i);
+            if (reduceMatch) {
+                const from = Number(reduceMatch[1].replace(/,/g, ''));
+                const to = Number(reduceMatch[2].replace(/,/g, ''));
+                if (Number.isFinite(from)) runState.originalCount = from;
+                if (Number.isFinite(to)) runState.compressedCount = to;
+            }
+            const passDoneMatch = line.match(/simplifyGaussians:\s*pass done\s*→\s*([\d,]+)/i);
+            if (passDoneMatch) {
+                const n = Number(passDoneMatch[1].replace(/,/g, ''));
+                if (Number.isFinite(n)) runState.compressedCount = n;
             }
 
             const stepMatch = line.match(/\[(\d+)\/(\d+)\]/);
@@ -1020,9 +1159,9 @@ const runPhase2Compose = async (runState, levels, inputAbsPath, outputRootAbsPat
     });
 };
 
-const startRun = async (payload) => {
+const startLodRun = async (payload) => {
     if (activeRun) {
-        throw new Error('A conversion run is already active. Please stop it first.');
+        throw new Error('已有任务在运行，请先点「停止」。');
     }
 
     const resume = payload.resume !== false;
@@ -1055,7 +1194,7 @@ const startRun = async (payload) => {
     const outputRoot = `${payload.outputRoot ?? 'output/live-lod'}`.trim();
 
     if (!inputPath) {
-        throw new Error('inputPath is required.');
+        throw new Error('请先选择输入文件。');
     }
 
     const inputAbsPath = path.isAbsolute(inputPath) ? inputPath : path.resolve(repoRoot, inputPath);
@@ -1063,13 +1202,14 @@ const startRun = async (payload) => {
 
     const inputStat = await stat(inputAbsPath).catch(() => null);
     if (!inputStat || !inputStat.isFile()) {
-        throw new Error(`Input file not found: ${inputAbsPath}`);
+        throw new Error(`找不到输入文件：${inputAbsPath}。请确认路径存在，或把文件放到仓库 input/ 目录。`);
     }
 
     await mkdir(outputRootAbsPath, { recursive: true });
 
     const runState = {
         runId: `run-${Date.now()}`,
+        mode: 'lod',
         child: null,
         cancelled: false,
         finished: false,
@@ -1102,6 +1242,7 @@ const startRun = async (payload) => {
 
     sseBroadcast('run-start', {
         runId: runState.runId,
+        mode: 'lod',
         inputPath: inputAbsPath,
         outputRoot,
         outputMetaUrl: makeOutUrl(runState.runId, 'lod-meta.json'),
@@ -1112,6 +1253,7 @@ const startRun = async (payload) => {
         intermediateDir: INTERMEDIATE_DIR
     });
 
+    const pipeline = (async () => {
     try {
         // Fully complete → just load
         if (resume && await isLodOutputComplete(outputRootAbsPath, requiredLods)) {
@@ -1129,6 +1271,7 @@ const startRun = async (payload) => {
             runState.lastPercent = 100;
             sseBroadcast('run-complete', {
                 runId: runState.runId,
+                mode: 'lod',
                 outputMetaUrl: makeOutUrl(runState.runId, 'lod-meta.json'),
                 resumed: true
             });
@@ -1158,6 +1301,7 @@ const startRun = async (payload) => {
 
         sseBroadcast('run-complete', {
             runId: runState.runId,
+            mode: 'lod',
             outputMetaUrl: makeOutUrl(runState.runId, 'lod-meta.json'),
             resumed: false
         });
@@ -1181,6 +1325,414 @@ const startRun = async (payload) => {
             activeRun = null;
         }
     }
+    })();
+    pipeline.catch(() => {});
+    return { runId: runState.runId, mode: 'lod' };
+};
+
+const readPlyVertexCount = async (filePath) => {
+    try {
+        const fh = await open(filePath, 'r');
+        try {
+            const buf = Buffer.alloc(8192);
+            await fh.read(buf, 0, 8192, 0);
+            const match = buf.toString('latin1').match(/element\s+vertex\s+(\d+)/i);
+            const n = match ? Number(match[1]) : null;
+            return Number.isFinite(n) ? n : null;
+        } finally {
+            await fh.close();
+        }
+    } catch {
+        return null;
+    }
+};
+
+const applyCompressPreviewUrls = async (runState) => {
+    if (!runState?.outputRootAbsPath || !runState.runId) return;
+    const origSog = path.join(runState.outputRootAbsPath, PREVIEW_ORIGINAL_SOG);
+    const compSog = path.join(runState.outputRootAbsPath, PREVIEW_COMPRESSED_SOG);
+    const hasOrigSog = await isNonEmptyFile(origSog);
+    const hasCompSog = await isNonEmptyFile(compSog);
+
+    if (hasOrigSog) {
+        runState.originalPreviewUrl = makeOutUrl(runState.runId, PREVIEW_ORIGINAL_SOG);
+        runState.skipOriginalPreview = false;
+    } else if (!runState.originalPreviewUrl && runState.inputAbsPath) {
+        runState.originalPreviewUrl = makeInputPreviewUrl(runState.inputAbsPath);
+        runState.skipOriginalPreview = (runState.originalSizeBytes ?? 0) > PREVIEW_MAX_BYTES;
+    }
+
+    if (hasCompSog) {
+        runState.compressedPreviewUrl = makeOutUrl(runState.runId, PREVIEW_COMPRESSED_SOG);
+        runState.skipCompressedPreview = false;
+    } else if (runState.compressedFileName) {
+        runState.compressedPreviewUrl = makeOutUrl(runState.runId, runState.compressedFileName);
+        runState.skipCompressedPreview = (runState.compressedSizeBytes ?? 0) > PREVIEW_MAX_BYTES;
+    }
+};
+
+const writePreviewSog = async (runState, srcAbs, destAbs, label, base, span) => {
+    runState.progressBase = base;
+    runState.progressSpan = span;
+    sseBroadcast('progress', {
+        runId: runState.runId,
+        type: 'server',
+        line: `正在生成${label}三维预览（SOG，体积更小，便于浏览器加载）…`,
+        percent: base,
+        phase: 1
+    });
+    await runCli(runState, ['-w', srcAbs, destAbs]);
+};
+
+const PREVIEW_META_FILENAME = 'preview-meta.json';
+
+const readPreviewMeta = async (metaPath) => readCompressMeta(metaPath);
+
+const ensureCompressPreviewAssets = async (
+    runState,
+    inputAbsPath,
+    compressedAbsPath,
+    { forceCompressed = false } = {}
+) => {
+    const origSog = path.join(runState.outputRootAbsPath, PREVIEW_ORIGINAL_SOG);
+    const compSog = path.join(runState.outputRootAbsPath, PREVIEW_COMPRESSED_SOG);
+    const previewMetaPath = path.join(runState.outputRootAbsPath, PREVIEW_META_FILENAME);
+    const previewMeta = await readPreviewMeta(previewMetaPath);
+    const keepMatches = Number(previewMeta?.keepPercent) === Number(runState.keepPercent);
+    const mustRebuildCompressed = forceCompressed || !keepMatches || !(await isNonEmptyFile(compSog));
+
+    sseBroadcast('compress-plan', {
+        runId: runState.runId,
+        taskName: '对比预览',
+        keepPercent: runState.keepPercent
+    });
+    trackTask(runState, '对比预览', { progress: 5, status: '正在计算' });
+
+    try {
+        if (mustRebuildCompressed) {
+            await rm(compSog, { force: true }).catch(() => {});
+            await writePreviewSog(runState, compressedAbsPath, compSog, '压缩后', 72, 13);
+            await writeFile(previewMetaPath, JSON.stringify({
+                keepPercent: runState.keepPercent,
+                compressedFile: path.basename(compressedAbsPath),
+                createdAt: new Date().toISOString()
+            }, null, 2), 'utf-8');
+        }
+        if (!(await isNonEmptyFile(origSog))) {
+            await writePreviewSog(runState, inputAbsPath, origSog, '原始', 85, 13);
+        }
+        trackTask(runState, '对比预览', { progress: 100, status: '已计算' }, { force: true });
+    } catch (error) {
+        trackTask(runState, '对比预览', { progress: 0, status: '计算失败' }, { force: true });
+        sseBroadcast('progress', {
+            runId: runState.runId,
+            type: 'server',
+            line: `预览资源生成失败，将尝试直接加载 PLY：${error instanceof Error ? error.message : error}`,
+            percent: Math.max(runState.lastPercent ?? 0, 90),
+            phase: 1
+        });
+    }
+
+    await applyCompressPreviewUrls(runState);
+};
+
+const emitCompressComplete = (runState, { resumed = false } = {}) => {
+    sseBroadcast('run-complete', {
+        runId: runState.runId,
+        mode: 'compress',
+        resumed,
+        keepPercent: runState.keepPercent,
+        originalUrl: runState.originalPreviewUrl,
+        compressedUrl: runState.compressedPreviewUrl,
+        originalSizeBytes: runState.originalSizeBytes,
+        compressedSizeBytes: runState.compressedSizeBytes,
+        originalCount: runState.originalCount,
+        compressedCount: runState.compressedCount,
+        skipOriginalPreview: runState.skipOriginalPreview,
+        skipCompressedPreview: runState.skipCompressedPreview,
+        outputFile: runState.compressedFileName
+    });
+};
+
+/**
+ * Compress-only pipeline: decimate a single PLY (or other splat) to a keep-ratio output.
+ * Does not generate LOD layers / lod-meta / chunks.
+ */
+const startCompressRun = async (payload) => {
+    if (activeRun) {
+        throw new Error('已有任务在运行，请先点「停止」。');
+    }
+
+    const resume = payload.resume !== false;
+    const keepPercent = clampKeepPercent(payload.keepPercent);
+    const decimateArg = `${keepPercent}%`;
+
+    const inputPath = `${payload.inputPath ?? ''}`.trim();
+    const outputRoot = `${payload.outputRoot ?? 'output/compressed'}`.trim();
+
+    if (!inputPath) {
+        throw new Error('请先选择输入文件。');
+    }
+
+    const inputAbsPath = path.isAbsolute(inputPath) ? inputPath : path.resolve(repoRoot, inputPath);
+    const outputRootAbsPath = path.isAbsolute(outputRoot) ? outputRoot : path.resolve(repoRoot, outputRoot);
+
+    const inputStat = await stat(inputAbsPath).catch(() => null);
+    if (!inputStat || !inputStat.isFile()) {
+        throw new Error(`找不到输入文件：${inputAbsPath}。请确认路径存在，或把文件放到仓库 input/ 目录。`);
+    }
+
+    await mkdir(outputRootAbsPath, { recursive: true });
+
+    const compressedFileName = COMPRESS_FILENAME;
+    const outPath = path.join(outputRootAbsPath, compressedFileName);
+    const metaPath = path.join(outputRootAbsPath, COMPRESS_META_FILENAME);
+    const originalPreviewUrl = makeInputPreviewUrl(inputAbsPath);
+
+    const runState = {
+        runId: `run-${Date.now()}`,
+        mode: 'compress',
+        child: null,
+        cancelled: false,
+        finished: false,
+        lastPercent: 0,
+        lastLine: '压缩已开始…',
+        currentLod: null,
+        currentChunkName: null,
+        outputRootAbsPath,
+        inputAbsPath,
+        inputPathDisplay: inputPath,
+        outputRootDisplay: outputRoot,
+        levels: [],
+        keepPercent,
+        compressedFileName,
+        originalPreviewUrl,
+        compressedPreviewUrl: null,
+        originalSizeBytes: inputStat.size,
+        compressedSizeBytes: null,
+        originalCount: null,
+        compressedCount: null,
+        skipOriginalPreview: inputStat.size > PREVIEW_MAX_BYTES,
+        skipCompressedPreview: false,
+        startedLods: new Set(),
+        sentChunkPlan: false,
+        phase: 0,
+        progressBase: 0,
+        progressSpan: 100,
+        tasks: new Map(),
+        errorMessage: null
+    };
+    activeRun = runState;
+    lastRunSnapshot = null;
+    outputRoots.set(runState.runId, outputRootAbsPath);
+
+    sseBroadcast('run-start', {
+        runId: runState.runId,
+        mode: 'compress',
+        inputPath: inputAbsPath,
+        outputRoot,
+        keepPercent,
+        pipeline: 'compress',
+        originalUrl: originalPreviewUrl
+    });
+
+    const pipeline = (async () => {
+    try {
+        const existingMeta = await readCompressMeta(metaPath);
+        const canResume = resume
+            && await isNonEmptyFile(outPath)
+            && Number(existingMeta?.keepPercent) === keepPercent;
+
+        sseBroadcast('phase-start', {
+            runId: runState.runId,
+            phase: 1,
+            title: `压缩模型 · 保留 ${decimateArg}`,
+            total: 1
+        });
+
+        sseBroadcast('compress-plan', {
+            runId: runState.runId,
+            taskName: '原模型',
+            keepPercent
+        });
+        sseBroadcast('compress-plan', {
+            runId: runState.runId,
+            taskName: '压缩输出',
+            keepPercent
+        });
+
+        trackTask(runState, '原模型', { progress: 100, status: '已计算' }, { force: true });
+        sseBroadcast('compress-original-ready', {
+            runId: runState.runId,
+            taskName: '原模型',
+            previewUrl: originalPreviewUrl,
+            sizeBytes: inputStat.size,
+            skipPreview: runState.skipOriginalPreview
+        });
+
+        if (canResume) {
+            const outStat = await stat(outPath);
+            runState.compressedSizeBytes = outStat.size;
+            runState.originalCount = existingMeta?.originalCount
+                ?? await readPlyVertexCount(inputAbsPath)
+                ?? runState.originalCount;
+            runState.compressedCount = existingMeta?.compressedCount
+                ?? await readPlyVertexCount(outPath)
+                ?? runState.compressedCount;
+            trackTask(runState, '压缩输出', { progress: 100, status: '已计算' }, { force: true });
+
+            sseBroadcast('progress', {
+                runId: runState.runId,
+                type: 'server',
+                line: `检测到已有保留 ${decimateArg} 的压缩结果，正在准备对比预览…`,
+                percent: 70,
+                phase: 1
+            });
+
+            await ensureCompressPreviewAssets(runState, inputAbsPath, outPath, { forceCompressed: false });
+            runState.lastPercent = 100;
+
+            sseBroadcast('compress-ready', {
+                runId: runState.runId,
+                resumed: true,
+                keepPercent,
+                originalUrl: runState.originalPreviewUrl,
+                compressedUrl: runState.compressedPreviewUrl,
+                originalSizeBytes: runState.originalSizeBytes,
+                compressedSizeBytes: runState.compressedSizeBytes,
+                originalCount: runState.originalCount,
+                compressedCount: runState.compressedCount,
+                skipOriginalPreview: runState.skipOriginalPreview,
+                skipCompressedPreview: runState.skipCompressedPreview,
+                path: outPath
+            });
+
+            sseBroadcast('phase-complete', {
+                runId: runState.runId,
+                phase: 1,
+                percent: 100
+            });
+            emitCompressComplete(runState, { resumed: true });
+            return;
+        }
+
+        trackTask(runState, '压缩输出', { progress: 5, status: '正在计算' });
+        sseBroadcast('compress-start', {
+            runId: runState.runId,
+            taskName: '压缩输出',
+            keepPercent,
+            decimate: decimateArg
+        });
+
+        sseBroadcast('progress', {
+            runId: runState.runId,
+            type: 'server',
+            line: `正在简化模型（保留 ${decimateArg}）→ ${outPath}`,
+            percent: 2,
+            phase: 1
+        });
+
+        runState.progressBase = 0;
+        runState.progressSpan = 70;
+        await rm(path.join(outputRootAbsPath, PREVIEW_COMPRESSED_SOG), { force: true }).catch(() => {});
+        await rm(path.join(outputRootAbsPath, PREVIEW_META_FILENAME), { force: true }).catch(() => {});
+        await runCli(runState, ['-w', inputAbsPath, '-F', decimateArg, outPath]);
+
+        const outStat = await stat(outPath).catch(() => null);
+        if (!outStat?.isFile() || outStat.size <= 64) {
+            throw new Error(`压缩输出写入失败: ${outPath}`);
+        }
+
+        runState.compressedSizeBytes = outStat.size;
+        runState.originalCount = await readPlyVertexCount(inputAbsPath) ?? runState.originalCount;
+        runState.compressedCount = await readPlyVertexCount(outPath) ?? runState.compressedCount;
+        runState.lastPercent = Math.max(runState.lastPercent ?? 0, 70);
+
+        await writeFile(metaPath, JSON.stringify({
+            mode: 'compress',
+            keepPercent,
+            inputPath: inputAbsPath,
+            outputFile: compressedFileName,
+            originalSizeBytes: runState.originalSizeBytes,
+            compressedSizeBytes: runState.compressedSizeBytes,
+            originalCount: runState.originalCount,
+            compressedCount: runState.compressedCount,
+            createdAt: new Date().toISOString()
+        }, null, 2), 'utf-8');
+
+        trackTask(runState, '压缩输出', { progress: 100, status: '已计算' }, { force: true });
+
+        sseBroadcast('progress', {
+            runId: runState.runId,
+            type: 'server',
+            line: `压缩完成：${formatBytes(runState.originalSizeBytes)} → ${formatBytes(runState.compressedSizeBytes)}（保留 ${decimateArg}）。接着生成对比预览…`,
+            percent: 70,
+            phase: 1
+        });
+
+        await ensureCompressPreviewAssets(runState, inputAbsPath, outPath, { forceCompressed: true });
+        runState.lastPercent = 100;
+
+        sseBroadcast('compress-ready', {
+            runId: runState.runId,
+            resumed: false,
+            keepPercent,
+            originalUrl: runState.originalPreviewUrl,
+            compressedUrl: runState.compressedPreviewUrl,
+            originalSizeBytes: runState.originalSizeBytes,
+            compressedSizeBytes: runState.compressedSizeBytes,
+            originalCount: runState.originalCount,
+            compressedCount: runState.compressedCount,
+            skipOriginalPreview: runState.skipOriginalPreview,
+            skipCompressedPreview: runState.skipCompressedPreview,
+            path: outPath
+        });
+
+        sseBroadcast('progress', {
+            runId: runState.runId,
+            type: 'server',
+            line: `压缩完成：${formatBytes(runState.originalSizeBytes)} → ${formatBytes(runState.compressedSizeBytes)}（保留 ${decimateArg}）`,
+            percent: 100,
+            phase: 1
+        });
+
+        sseBroadcast('phase-complete', {
+            runId: runState.runId,
+            phase: 1,
+            percent: 100
+        });
+        emitCompressComplete(runState, { resumed: false });
+    } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (message === 'Run cancelled') {
+            return;
+        }
+        sseBroadcast('run-error', {
+            runId: runState.runId,
+            message
+        });
+        throw error;
+    } finally {
+        if (activeRun?.runId === runState.runId) {
+            try {
+                lastRunSnapshot = await getRunSnapshot(runState);
+            } catch {
+                lastRunSnapshot = null;
+            }
+            activeRun = null;
+        }
+    }
+    })();
+    pipeline.catch(() => {});
+    return { runId: runState.runId, mode: 'compress' };
+};
+
+const startRun = async (payload) => {
+    const mode = `${payload?.mode ?? 'lod'}`.trim() === 'compress' ? 'compress' : 'lod';
+    if (mode === 'compress') {
+        return startCompressRun(payload);
+    }
+    return startLodRun(payload);
 };
 
 const parseBody = async (req) => {
@@ -1255,12 +1807,139 @@ const serveFile = async (res, filePath) => {
         res.writeHead(200, {
             'Content-Type': MIME_MAP[ext] || 'application/octet-stream',
             'Content-Length': fileStat.size,
-            'Cache-Control': 'no-cache'
+            'Cache-Control': 'no-store, no-cache, must-revalidate'
         });
         createReadStream(filePath).pipe(res);
     } catch {
         sendJson(res, 404, { error: 'Not found' });
     }
+};
+
+const contentDisposition = (downloadName) => {
+    const ascii = `${downloadName}`.replace(/[^\x20-\x7E]/g, '_').replace(/["\\]/g, '_');
+    return `attachment; filename="${ascii || 'download'}"; filename*=UTF-8''${encodeURIComponent(downloadName)}`;
+};
+
+const serveDownload = async (res, filePath, downloadName) => {
+    try {
+        const fileStat = await stat(filePath);
+        if (!fileStat.isFile()) {
+            sendJson(res, 404, { error: 'File not found' });
+            return;
+        }
+        const ext = path.extname(filePath).toLowerCase();
+        res.writeHead(200, {
+            'Content-Type': MIME_MAP[ext] || 'application/octet-stream',
+            'Content-Length': fileStat.size,
+            'Content-Disposition': contentDisposition(downloadName || path.basename(filePath)),
+            'Cache-Control': 'no-store, no-cache, must-revalidate'
+        });
+        createReadStream(filePath).pipe(res);
+    } catch {
+        sendJson(res, 404, { error: 'File not found' });
+    }
+};
+
+const resolveDownloadOutputRoot = (outputRoot) => {
+    const text = `${outputRoot ?? ''}`.trim();
+    if (!text) {
+        throw new Error('请填写输出目录。');
+    }
+    const abs = path.isAbsolute(text) ? path.resolve(text) : path.resolve(repoRoot, text);
+    if (!isPathInside(abs, repoRoot)) {
+        throw new Error('只能下载工具仓库内的输出文件。');
+    }
+    return abs;
+};
+
+const pickPrimaryOutputFile = (names) => {
+    const set = new Set(names.map((n) => n.toLowerCase()));
+    const preferred = ['compressed.ply', 'lod-meta.json'];
+    for (const name of preferred) {
+        if (set.has(name)) return names.find((n) => n.toLowerCase() === name);
+    }
+    const ply = names.find((n) => n.toLowerCase().endsWith('.ply') && !n.toLowerCase().includes('preview'));
+    if (ply) return ply;
+    return names[0] || null;
+};
+
+const makeServedOutputBase = (absDir) => {
+    try {
+        const rel = path.relative(repoRoot, absDir).replaceAll('\\', '/');
+        if (rel && !rel.startsWith('..') && !path.isAbsolute(rel)) {
+            return `/repo/${rel.split('/').map((part) => encodeURIComponent(part)).join('/')}`;
+        }
+    } catch {
+        // fall through
+    }
+    const token = `open-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    outputRoots.set(token, absDir);
+    return `/out/${encodeURIComponent(token)}`;
+};
+
+const inspectOutputFolder = async (abs) => {
+    const files = await listOutputFiles(abs);
+    const names = files.map((item) => item.name);
+    const lower = new Set(names.map((name) => name.toLowerCase()));
+    const hasLod = lower.has('lod-meta.json');
+    const hasCompress = lower.has('compressed.ply') || lower.has('compress-meta.json');
+    const kind = hasLod ? 'lod' : hasCompress ? 'compress' : null;
+    let lodLevels = null;
+    let keepPercent = null;
+    let originalCount = null;
+    let compressedCount = null;
+    let originalSizeBytes = null;
+    let compressedSizeBytes = null;
+
+    if (hasLod) {
+        try {
+            const parsed = JSON.parse(await readFile(path.join(abs, 'lod-meta.json'), 'utf-8'));
+            lodLevels = Number(parsed?.lodLevels);
+            if (!Number.isFinite(lodLevels) || lodLevels <= 0) lodLevels = null;
+        } catch {
+            lodLevels = null;
+        }
+    }
+
+    if (hasCompress) {
+        const meta = await readCompressMeta(path.join(abs, COMPRESS_META_FILENAME));
+        keepPercent = meta?.keepPercent ?? null;
+        originalCount = meta?.originalCount ?? null;
+        compressedCount = meta?.compressedCount ?? null;
+        originalSizeBytes = meta?.originalSizeBytes ?? null;
+        compressedSizeBytes = meta?.compressedSizeBytes ?? files.find((f) => f.name.toLowerCase() === 'compressed.ply')?.sizeBytes ?? null;
+    }
+
+    return {
+        files,
+        kind,
+        canPreview: Boolean(kind),
+        hasLod,
+        hasCompress,
+        lodLevels,
+        keepPercent,
+        originalCount,
+        compressedCount,
+        originalSizeBytes,
+        compressedSizeBytes
+    };
+};
+
+const listOutputFiles = async (outputRootAbsPath) => {
+    const entries = await safeReadDir(outputRootAbsPath);
+    const files = [];
+    for (const entry of entries) {
+        if (!entry.isFile()) continue;
+        const full = path.join(outputRootAbsPath, entry.name);
+        const st = await stat(full).catch(() => null);
+        if (!st?.isFile()) continue;
+        files.push({
+            name: entry.name,
+            sizeBytes: st.size
+        });
+    }
+    files.sort((a, b) => a.name.localeCompare(b.name, 'en', { numeric: true }));
+    return files;
 };
 
 const server = http.createServer(async (req, res) => {
@@ -1320,6 +1999,8 @@ const server = http.createServer(async (req, res) => {
             chunkCountK: 512,
             chunkExtent: 16,
             pipeline: 'two-phase',
+            mode: 'lod',
+            keepPercent: DEFAULT_KEEP_PERCENT,
             splatTransformRoot
         });
         return;
@@ -1328,10 +2009,8 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'POST' && reqUrl.pathname === '/api/start') {
         try {
             const body = await parseBody(req);
-            startRun(body).catch(() => {
-                // error is broadcasted as run-error event
-            });
-            sendJson(res, 200, { ok: true });
+            const launched = await startRun(body);
+            sendJson(res, 200, { ok: true, runId: launched.runId, mode: launched.mode });
         } catch (error) {
             sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) });
         }
@@ -1348,7 +2027,7 @@ const server = http.createServer(async (req, res) => {
         try {
             const body = await parseBody(req);
             const fileName = path.basename(`${body.fileName ?? body.name ?? ''}`.trim());
-            const hintPath = `${body.path ?? ''}`.trim();
+            const hintPath = normalizeDroppedPath(`${body.path ?? ''}`.trim());
 
             if (hintPath) {
                 const abs = path.isAbsolute(hintPath) ? hintPath : path.resolve(repoRoot, hintPath);
@@ -1395,16 +2074,172 @@ const server = http.createServer(async (req, res) => {
                 }
             }
 
-            // Not found: suggest placing under input/
-            const suggested = `input/${fileName}`.replaceAll('\\', '/');
             sendJson(res, 200, {
                 ok: true,
                 found: false,
-                value: suggested,
-                message: `未在仓库 input/ 中找到 ${fileName}，已填入建议路径。请把文件放到该位置，或使用浏览按钮选择绝对路径。`
+                value: '',
+                message: `未找到 ${fileName}。请使用浏览按钮选择真实路径，或把文件拖入窗口以导入。`
             });
         } catch (error) {
             sendJson(res, 500, { error: error instanceof Error ? error.message : String(error) });
+        }
+        return;
+    }
+
+    if (req.method === 'POST' && reqUrl.pathname === '/api/upload-input') {
+        try {
+            const rawName = reqUrl.searchParams.get('name')
+                || `${req.headers['x-file-name'] ?? ''}`;
+            const fileName = sanitizeUploadFileName(decodeURIComponent(rawName));
+            if (!isAcceptedInputFileName(fileName)) {
+                sendJson(res, 400, { error: `不支持的文件类型：${fileName}` });
+                return;
+            }
+
+            const inputDir = path.join(repoRoot, 'input');
+            await mkdir(inputDir, { recursive: true });
+            const destAbs = path.join(inputDir, fileName);
+            if (!isPathInside(destAbs, inputDir)) {
+                sendJson(res, 400, { error: 'Invalid upload path' });
+                return;
+            }
+
+            await pipeline(req, createWriteStream(destAbs));
+            const st = await stat(destAbs).catch(() => null);
+            if (!st?.isFile() || st.size <= 0) {
+                sendJson(res, 500, { error: '文件导入失败，未写入内容。' });
+                return;
+            }
+
+            sendJson(res, 200, {
+                ok: true,
+                value: `input/${fileName}`.replaceAll('\\', '/'),
+                absPath: destAbs,
+                sizeBytes: st.size
+            });
+        } catch (error) {
+            sendJson(res, 500, { error: error instanceof Error ? error.message : String(error) });
+        }
+        return;
+    }
+
+    if (req.method === 'GET' && reqUrl.pathname === '/api/output-files') {
+        try {
+            const outputRoot = `${reqUrl.searchParams.get('root') ?? ''}`.trim();
+            const abs = resolveDownloadOutputRoot(outputRoot);
+            const dirStat = await stat(abs).catch(() => null);
+            if (!dirStat?.isDirectory()) {
+                sendJson(res, 200, { ok: true, exists: false, files: [], primary: null, absPath: abs });
+                return;
+            }
+            const inspected = await inspectOutputFolder(abs);
+            sendJson(res, 200, {
+                ok: true,
+                exists: true,
+                absPath: abs,
+                files: inspected.files,
+                primary: pickPrimaryOutputFile(inspected.files.map((f) => f.name)),
+                kind: inspected.kind,
+                canPreview: inspected.canPreview,
+                lodLevels: inspected.lodLevels,
+                keepPercent: inspected.keepPercent
+            });
+        } catch (error) {
+            sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) });
+        }
+        return;
+    }
+
+    if (req.method === 'POST' && reqUrl.pathname === '/api/open-output') {
+        try {
+            const body = await parseBody(req);
+            const outputRoot = `${body.outputRoot ?? ''}`.trim();
+            const abs = resolveDownloadOutputRoot(outputRoot);
+            const dirStat = await stat(abs).catch(() => null);
+            if (!dirStat?.isDirectory()) {
+                sendJson(res, 404, { error: `输出目录不存在：${abs}` });
+                return;
+            }
+            const inspected = await inspectOutputFolder(abs);
+            if (!inspected.kind) {
+                sendJson(res, 400, { error: '该目录没有可预览的结果（需要 lod-meta.json 或 compressed.ply）。' });
+                return;
+            }
+
+            const base = makeServedOutputBase(abs);
+            if (inspected.kind === 'lod') {
+                const lodCount = inspected.lodLevels || 1;
+                sendJson(res, 200, {
+                    ok: true,
+                    kind: 'lod',
+                    outputRoot,
+                    absPath: abs,
+                    lodLevels: lodCount,
+                    levels: Array.from({ length: lodCount }, (_, i) => ({
+                        lod: lodCount - 1 - i,
+                        decimate: '',
+                        chunkCountK: 512
+                    })),
+                    outputMetaUrl: `${base}/lod-meta.json`
+                });
+                return;
+            }
+
+            const hasOrigSog = inspected.files.some((f) => f.name === PREVIEW_ORIGINAL_SOG);
+            const hasCompSog = inspected.files.some((f) => f.name === PREVIEW_COMPRESSED_SOG);
+            const compressedSize = inspected.files.find((f) => f.name.toLowerCase() === 'compressed.ply')?.sizeBytes ?? inspected.compressedSizeBytes;
+            sendJson(res, 200, {
+                ok: true,
+                kind: 'compress',
+                outputRoot,
+                absPath: abs,
+                keepPercent: inspected.keepPercent,
+                originalCount: inspected.originalCount,
+                compressedCount: inspected.compressedCount,
+                originalSizeBytes: inspected.originalSizeBytes,
+                compressedSizeBytes: compressedSize,
+                originalUrl: hasOrigSog ? `${base}/${PREVIEW_ORIGINAL_SOG}` : null,
+                compressedUrl: hasCompSog
+                    ? `${base}/${PREVIEW_COMPRESSED_SOG}`
+                    : `${base}/${COMPRESS_FILENAME}`,
+                skipOriginalPreview: !hasOrigSog,
+                skipCompressedPreview: !hasCompSog && (compressedSize ?? 0) > PREVIEW_MAX_BYTES
+            });
+        } catch (error) {
+            sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) });
+        }
+        return;
+    }
+
+    if (req.method === 'GET' && reqUrl.pathname === '/api/download-output') {
+        try {
+            const outputRoot = `${reqUrl.searchParams.get('root') ?? ''}`.trim();
+            const requested = path.basename(`${reqUrl.searchParams.get('name') ?? ''}`.trim());
+            const abs = resolveDownloadOutputRoot(outputRoot);
+            const dirStat = await stat(abs).catch(() => null);
+            if (!dirStat?.isDirectory()) {
+                sendJson(res, 404, { error: `输出目录不存在：${abs}` });
+                return;
+            }
+            const files = await listOutputFiles(abs);
+            const names = files.map((f) => f.name);
+            const fileName = requested || pickPrimaryOutputFile(names);
+            if (!fileName || !names.includes(fileName)) {
+                sendJson(res, 404, { error: '输出目录中还没有可下载的结果文件。' });
+                return;
+            }
+            const target = path.resolve(abs, fileName);
+            if (!isPathInside(target, abs)) {
+                sendJson(res, 400, { error: 'Invalid file path' });
+                return;
+            }
+            const folder = path.basename(abs) || 'output';
+            const downloadName = fileName.toLowerCase() === 'compressed.ply'
+                ? `${folder}.ply`
+                : `${folder}-${fileName}`;
+            await serveDownload(res, target, downloadName);
+        } catch (error) {
+            sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) });
         }
         return;
     }
