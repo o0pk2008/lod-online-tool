@@ -27,7 +27,7 @@ const pickInputBtn = document.getElementById('pickInputBtn');
 const pickOutputBtn = document.getElementById('pickOutputBtn');
 const downloadOutputBtn = document.getElementById('downloadOutputBtn');
 const downloadOutputHint = document.getElementById('downloadOutputHint');
-const importPreviewBtn = document.getElementById('importPreviewBtn');
+const downloadMenu = document.getElementById('downloadMenu');
 const inputDropZone = document.getElementById('inputDropZone');
 const inputFileHidden = document.getElementById('inputFileHidden');
 const inputDropHint = document.getElementById('inputDropHint');
@@ -42,6 +42,16 @@ const statusDotEl = document.getElementById('statusDot');
 const statusPhaseEl = document.getElementById('statusPhase');
 const stepBarEl = document.getElementById('stepBar');
 const resetCameraBtn = document.getElementById('resetCameraBtn');
+const clearPreviewBtn = document.getElementById('clearPreviewBtn');
+const previewEmptyState = document.getElementById('previewEmptyState');
+const compareLeftPickBtn = document.getElementById('compareLeftPickBtn');
+const compareRightPickBtn = document.getElementById('compareRightPickBtn');
+const compareLoadBtn = document.getElementById('compareLoadBtn');
+const compareLeftFile = document.getElementById('compareLeftFile');
+const compareRightFile = document.getElementById('compareRightFile');
+const lodMetaPickBtn = document.getElementById('lodMetaPickBtn');
+const lodImportPath = document.getElementById('lodImportPath');
+const lodImportBtn = document.getElementById('lodImportBtn');
 const lodDebugBtn = document.getElementById('lodDebugBtn');
 const lodDebugPanel = document.getElementById('lodDebugPanel');
 const lodColorizeToggle = document.getElementById('lodColorizeToggle');
@@ -73,7 +83,7 @@ const compareDivider = document.getElementById('compareDivider');
 const compareLabelLeft = document.getElementById('compareLabelLeft');
 const compareLabelRight = document.getElementById('compareLabelRight');
 
-const CONFIG_STORAGE_KEY = 'lod-online-tool:config:v1';
+const CONFIG_STORAGE_KEY = 'lod-online-tool:config:v2';
 const INPUT_EXTS = ['.ply', '.sog', '.splat', '.spz', '.ksplat'];
 const WORK_MODE = {
     lod: 'lod',
@@ -102,6 +112,10 @@ const COPY = {
 
 /** Last auto-suggested output path; used so we only overwrite output when still "auto" */
 let lastSuggestedOutput = '';
+/** True only when the browser is on the same machine as the server (loopback). */
+let localClient = true;
+let outputDownloadKind = null;
+let outputDownloadOptions = [];
 
 let activeRunId = null;
 let currentLod = null;
@@ -135,6 +149,8 @@ let keepPercent = 60;
 let compareSplit = 0.5;
 let isDraggingSplit = false;
 let lastComparePayload = null;
+let compareImportLeft = null;
+let compareImportRight = null;
 
 const app = new Application(canvas, {
     graphicsDeviceOptions: {
@@ -344,6 +360,15 @@ const enableCompareView = () => {
 };
 
 const updateCompareLabels = (payload = {}) => {
+    if (payload.manualImport || payload.leftLabel || payload.rightLabel) {
+        const leftParts = [payload.leftLabel || '左侧'];
+        if (payload.originalSizeBytes != null) leftParts.push(formatBytes(payload.originalSizeBytes));
+        const rightParts = [payload.rightLabel || '右侧'];
+        if (payload.compressedSizeBytes != null) rightParts.push(formatBytes(payload.compressedSizeBytes));
+        if (compareLabelLeft) compareLabelLeft.textContent = leftParts.join(' · ');
+        if (compareLabelRight) compareLabelRight.textContent = rightParts.join(' · ');
+        return;
+    }
     const keep = Number(payload.keepPercent ?? keepPercent);
     const origParts = ['原始'];
     const origCount = formatCount(payload.originalCount);
@@ -686,6 +711,52 @@ const clearCurrentLevelRender = () => {
     previewMode = PREVIEW_MODE.none;
 };
 
+const hasPreviewContent = () => (
+    previewMode !== PREVIEW_MODE.none
+    || chunkEntities.length > 0
+    || loadedChunkCount > 0
+    || showingFinalLod
+);
+
+const updatePreviewChrome = () => {
+    const hasContent = hasPreviewContent();
+    const busy = Boolean(activeRunId);
+    if (previewEmptyState) {
+        previewEmptyState.classList.toggle('hidden', hasContent || busy);
+    }
+    if (clearPreviewBtn) {
+        clearPreviewBtn.classList.toggle('hidden', !hasContent || busy);
+        clearPreviewBtn.disabled = busy;
+    }
+    if (compareLoadBtn) {
+        compareLoadBtn.disabled = busy || !compareImportLeft || !compareImportRight;
+    }
+    if (compareLeftPickBtn) compareLeftPickBtn.disabled = busy;
+    if (compareRightPickBtn) compareRightPickBtn.disabled = busy;
+    if (lodMetaPickBtn) lodMetaPickBtn.disabled = busy;
+    if (lodImportBtn) lodImportBtn.disabled = busy;
+    if (lodImportPath) lodImportPath.disabled = busy;
+};
+
+const clearPreviewData = () => {
+    if (activeRunId) {
+        setProgress('任务进行中，请先停止后再清空预览。');
+        return;
+    }
+    clearCurrentLevelRender();
+    lastComparePayload = null;
+    finalLodMetaUrl = null;
+    currentLod = null;
+    currentChunkName = null;
+    pipelinePhase = 0;
+    if (currentLodEl) currentLodEl.textContent = '-';
+    setViewMode('等待数据');
+    setStatusPhase('就绪', 'idle');
+    setProgress('已清空预览数据');
+    resetCameraHome();
+    updatePreviewChrome();
+};
+
 const loadGsplatUrl = async (url, options = {}) => {
     const {
         name = `gsplat-${Date.now()}`,
@@ -785,12 +856,14 @@ const loadIntermediatePreview = async (data) => {
         setChunkTaskStatus(data.taskName || `中间 L${data.lod}`, '已计算', 100);
         renderTaskTable();
         setProgress(`阶段1：L${data.lod} 中间结果预览中`);
+        updatePreviewChrome();
         return true;
     } catch (error) {
         setViewMode(`L${data.lod} 中间预览失败`);
         setProgress(`中间文件预览失败 L${data.lod}: ${error.message || error}（文件仍可用于合成）`);
         setChunkTaskStatus(data.taskName || `中间 L${data.lod}`, '已计算', 100);
         renderTaskTable();
+        updatePreviewChrome();
         return false;
     }
 };
@@ -822,10 +895,12 @@ const loadFinalLodMeta = async (metaUrl) => {
         setStatusPhase('完成', 'ok');
         setProgress('转换完成：已加载完整多层 LOD。可用「LOD 调试」按层级着色查看。', 100);
         setLodDebugUiVisible(true);
+        updatePreviewChrome();
         return true;
     } catch (error) {
         setStatusPhase('完成(预览失败)', 'warn');
         setProgress(`最终 lod-meta 加载失败: ${error.message || error}`);
+        updatePreviewChrome();
         return false;
     }
 };
@@ -851,12 +926,18 @@ const loadComparePreview = async (payload) => {
         chunkCountEl.textContent = '2';
         loadedChunkCount = 2;
         setStatusPhase('完成', 'ok');
-        const keep = Number(data.keepPercent ?? keepPercent);
-        const sizeHint = (data.originalSizeBytes != null && data.compressedSizeBytes != null)
-            ? ` 体积 ${formatBytes(data.originalSizeBytes)} → ${formatBytes(data.compressedSizeBytes)}。`
-            : '';
-        setViewMode('对比预览 · 左原始 / 右压缩 · 拖动中线');
-        setProgress(`压缩完成：保留 ${keep}%。拖动中间分割线对比效果。${sizeHint}`, 100);
+        if (data.manualImport) {
+            setViewMode('对比预览 · 拖动中线');
+            setProgress(`已加载对比：${data.leftLabel || '左侧'} / ${data.rightLabel || '右侧'}。可拖动中间分割线。`, 100);
+        } else {
+            const keep = Number(data.keepPercent ?? keepPercent);
+            const sizeHint = (data.originalSizeBytes != null && data.compressedSizeBytes != null)
+                ? ` 体积 ${formatBytes(data.originalSizeBytes)} → ${formatBytes(data.compressedSizeBytes)}。`
+                : '';
+            setViewMode('对比预览 · 左原始 / 右压缩 · 拖动中线');
+            setProgress(`压缩完成：保留 ${keep}%。拖动中间分割线对比效果。${sizeHint}`, 100);
+        }
+        updatePreviewChrome();
     };
 
     const markSingleSuccess = (label) => {
@@ -864,6 +945,7 @@ const loadComparePreview = async (payload) => {
         loadedChunkCount = 1;
         setStatusPhase('完成', 'ok');
         setViewMode(label);
+        updatePreviewChrome();
     };
 
     const loadSingle = async (url, label) => {
@@ -939,6 +1021,7 @@ const loadComparePreview = async (payload) => {
             disableCompareView();
             setStatusPhase('完成(预览失败)', 'warn');
             setProgress(`预览失败: ${fallbackError.message || fallbackError}。结果文件仍在输出目录中。`);
+            updatePreviewChrome();
             return false;
         }
     }
@@ -1056,6 +1139,8 @@ const setUiRunningState = (running) => {
     if (startBtnSpinner) {
         startBtnSpinner.classList.toggle('hidden', !running);
     }
+    if (running) hideDownloadMenu();
+    updatePreviewChrome();
 
     const selectors = [
         '#inputPath',
@@ -1063,7 +1148,6 @@ const setUiRunningState = (running) => {
         '#pickInputBtn',
         '#pickOutputBtn',
         '#downloadOutputBtn',
-        '#importPreviewBtn',
         '#lodCount',
         '#chunkCountK',
         '#levelForm input',
@@ -1139,6 +1223,7 @@ const applyWorkMode = (mode, { syncOutput = true } = {}) => {
     }
     if (syncOutput && inputPathEl.value.trim()) {
         maybeAutoFillOutput(inputPathEl.value, { force: false });
+        scheduleEnsureOutputDirectory();
     }
     if (!activeRunId) {
         setWorkflowStep(inputPathEl.value.trim() && outputRootEl.value.trim() ? 2 : 1);
@@ -1224,65 +1309,182 @@ const setInputPathValue = (value, { autoOutput = true, forceOutput = false } = {
     setWorkflowStep(next && outputRootEl.value.trim() ? 2 : 1);
     saveConfigToStorage();
     scheduleRefreshOutputDownloads();
+    if (next) scheduleEnsureOutputDirectory();
 };
 
 let outputDownloadPrimary = null;
 let outputListTimer = null;
+
+const hideDownloadMenu = () => {
+    if (!downloadMenu) return;
+    downloadMenu.classList.add('hidden');
+    downloadMenu.innerHTML = '';
+};
+
+const clearDownloadState = (hintText = '') => {
+    outputDownloadPrimary = null;
+    outputDownloadKind = null;
+    outputDownloadOptions = [];
+    hideDownloadMenu();
+    if (downloadOutputBtn) downloadOutputBtn.disabled = true;
+    if (hintText && downloadOutputHint) downloadOutputHint.textContent = hintText;
+};
+
+const syncCompareImportButtons = () => {
+    if (compareLeftPickBtn) {
+        compareLeftPickBtn.textContent = compareImportLeft?.name
+            ? `左侧：${compareImportLeft.name}`
+            : '选择左侧文件';
+        compareLeftPickBtn.title = compareImportLeft?.name || '选择左侧文件';
+    }
+    if (compareRightPickBtn) {
+        compareRightPickBtn.textContent = compareImportRight?.name
+            ? `右侧：${compareImportRight.name}`
+            : '选择右侧文件';
+        compareRightPickBtn.title = compareImportRight?.name || '选择右侧文件';
+    }
+    updatePreviewChrome();
+};
+
+const uploadPreviewCompareFile = (file, role) => new Promise((resolve, reject) => {
+    const name = file.name || `${role}.ply`;
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', `/api/preview-upload?role=${encodeURIComponent(role)}&name=${encodeURIComponent(name)}`);
+    xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+    xhr.setRequestHeader('X-File-Name', encodeURIComponent(name));
+    xhr.upload.onprogress = (event) => {
+        if (!event.lengthComputable) return;
+        const pct = Math.round((event.loaded / event.total) * 100);
+        setProgress(`正在上传${role === 'left' ? '左侧' : '右侧'} ${name}… ${pct}%`, pct);
+    };
+    xhr.onload = () => {
+        let parsed = {};
+        try {
+            parsed = JSON.parse(xhr.responseText || '{}');
+        } catch {
+            parsed = {};
+        }
+        if (xhr.status >= 200 && xhr.status < 300) {
+            resolve(parsed);
+            return;
+        }
+        reject(new Error(parsed.error || `上传失败（HTTP ${xhr.status}）`));
+    };
+    xhr.onerror = () => reject(new Error('上传中断，请检查网络后重试'));
+    xhr.send(file);
+});
+
+const startDownloadOption = (option) => {
+    const root = outputRootEl.value.trim();
+    if (!root || !option) {
+        setProgress('还没有可下载的结果文件。');
+        return;
+    }
+    hideDownloadMenu();
+    const params = new URLSearchParams({ root });
+    if (option.format === 'zip') {
+        params.set('format', 'zip');
+    } else if (option.name) {
+        params.set('name', option.name);
+    }
+    const url = `/api/download-output?${params.toString()}`;
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = option.name || 'download.zip';
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setProgress(`开始下载 ${option.label || option.name || '结果'}…`);
+};
+
+const showDownloadMenu = (options) => {
+    if (!downloadMenu) return;
+    downloadMenu.innerHTML = '';
+    options.forEach((option) => {
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'w-full px-3 py-2.5 text-left hover:bg-[#f6f9ff] border-b border-[#eef3f9] last:border-b-0';
+        btn.innerHTML = `
+            <div class="text-[12px] font-semibold text-[#0b1220]">${option.label}</div>
+            <div class="text-[11px] text-[#7b8494] mt-0.5">${option.hint || option.name || ''}</div>
+        `;
+        btn.addEventListener('click', (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            startDownloadOption(option);
+        });
+        downloadMenu.appendChild(btn);
+    });
+    downloadMenu.classList.remove('hidden');
+};
 
 const refreshOutputDownloads = async () => {
     if (!outputRootEl) return;
     const root = outputRootEl.value.trim();
     const idle = !activeRunId;
     if (!root) {
-        outputDownloadPrimary = null;
-        if (downloadOutputBtn) downloadOutputBtn.disabled = true;
-        if (importPreviewBtn) importPreviewBtn.disabled = true;
-        if (downloadOutputHint) downloadOutputHint.textContent = '已有结果可直接导入预览，不必重新转换';
+        clearDownloadState('转换完成后可在此下载结果');
         return;
     }
     try {
         const res = await fetch(`/api/output-files?root=${encodeURIComponent(root)}`);
         const data = await res.json();
         if (!res.ok) {
-            outputDownloadPrimary = null;
-            if (downloadOutputBtn) downloadOutputBtn.disabled = true;
-            if (importPreviewBtn) importPreviewBtn.disabled = true;
-            if (downloadOutputHint) downloadOutputHint.textContent = data.error || '无法读取输出目录';
+            clearDownloadState(data.error || '无法读取输出目录');
             return;
         }
         const files = Array.isArray(data.files) ? data.files : [];
         outputDownloadPrimary = data.primary || null;
-        const canDownload = Boolean(outputDownloadPrimary) && idle;
-        const canPreview = Boolean(data.canPreview) && idle;
-        if (downloadOutputBtn) downloadOutputBtn.disabled = !canDownload;
-        if (importPreviewBtn) importPreviewBtn.disabled = !canPreview;
+        outputDownloadOptions = Array.isArray(data.downloadOptions) ? data.downloadOptions : [];
+        if (!outputDownloadOptions.length) {
+            if (data.kind === 'lod') {
+                outputDownloadOptions = [{ id: 'lod-zip', label: 'LOD ZIP 包', format: 'zip', name: null }];
+            } else if (data.kind === 'compress' && outputDownloadPrimary) {
+                outputDownloadOptions = [{
+                    id: 'compress-file',
+                    label: outputDownloadPrimary,
+                    format: 'file',
+                    name: outputDownloadPrimary
+                }];
+            }
+        }
+        outputDownloadKind = data.downloadKind || outputDownloadOptions[0]?.format || null;
+        const canDownload = outputDownloadOptions.length > 0 && idle;
+        if (downloadOutputBtn) {
+            downloadOutputBtn.disabled = !canDownload;
+            downloadOutputBtn.textContent = outputDownloadOptions.length > 1 ? '下载结果 ▾' : '下载结果';
+        }
+        hideDownloadMenu();
         if (!downloadOutputHint) return;
         if (!data.exists) {
-            downloadOutputHint.textContent = '输出目录还不存在。转换完成后可导入预览或下载';
+            downloadOutputHint.textContent = '导入文件后会自动创建输出目录。转换完成后可下载结果';
             return;
         }
         if (data.kind === 'lod') {
             const levelText = data.lodLevels ? ` · ${data.lodLevels} 层` : '';
-            downloadOutputHint.textContent = `检测到 LOD 结果${levelText}，可导入预览`;
+            downloadOutputHint.textContent = `检测到 LOD 结果${levelText}，可下载 ZIP（不含中间 PLY）`;
             return;
         }
         if (data.kind === 'compress') {
             const keepText = data.keepPercent ? ` · 保留 ${data.keepPercent}%` : '';
-            downloadOutputHint.textContent = `检测到压缩结果${keepText}，可导入预览或下载`;
+            const hasSog = outputDownloadOptions.some((item) => `${item.name || ''}`.toLowerCase().endsWith('.sog'));
+            const hasPly = outputDownloadOptions.some((item) => `${item.name || ''}`.toLowerCase().endsWith('.ply'));
+            if (hasPly && hasSog) {
+                downloadOutputHint.textContent = `检测到压缩结果${keepText}，可选择下载 .ply 或 .sog`;
+            } else {
+                downloadOutputHint.textContent = `检测到压缩结果${keepText}，可下载`;
+            }
             return;
         }
         if (!outputDownloadPrimary) {
-            downloadOutputHint.textContent = '目录已创建，但还没有可预览的结果文件';
+            downloadOutputHint.textContent = '目录已创建，但还没有可下载的结果文件';
             return;
         }
         const primary = files.find((f) => f.name === outputDownloadPrimary);
         const sizeText = primary ? `（${formatBytes(primary.sizeBytes)}）` : '';
         downloadOutputHint.textContent = `可下载 ${outputDownloadPrimary}${sizeText}`;
     } catch (error) {
-        outputDownloadPrimary = null;
-        if (downloadOutputBtn) downloadOutputBtn.disabled = true;
-        if (importPreviewBtn) importPreviewBtn.disabled = true;
-        if (downloadOutputHint) downloadOutputHint.textContent = `读取输出目录失败: ${error.message || error}`;
+        clearDownloadState(`读取输出目录失败: ${error.message || error}`);
     }
 };
 
@@ -1372,22 +1574,108 @@ const collectDroppedPath = (dt, file = null) => {
 const uploadDroppedFile = async (file) => {
     const name = file.name || 'upload.ply';
     const sizeHint = Number.isFinite(file.size) ? `（${formatBytes(file.size)}）` : '';
-    setProgress(`正在导入 ${name}${sizeHint} 到 input/ …`);
-    const res = await fetch(`/api/upload-input?name=${encodeURIComponent(name)}`, {
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/octet-stream',
-            'X-File-Name': encodeURIComponent(name)
-        },
-        body: file
+    setProgress(`正在上传 ${name}${sizeHint} …`);
+
+    const data = await new Promise((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
+        const mode = currentMode === WORK_MODE.compress ? 'compress' : 'lod';
+        xhr.open('POST', `/api/upload-input?name=${encodeURIComponent(name)}&mode=${encodeURIComponent(mode)}`);
+        xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+        xhr.setRequestHeader('X-File-Name', encodeURIComponent(name));
+        xhr.upload.onprogress = (event) => {
+            if (!event.lengthComputable) return;
+            const pct = Math.round((event.loaded / event.total) * 100);
+            setProgress(
+                `正在上传 ${name}… ${pct}%（${formatBytes(event.loaded)} / ${formatBytes(event.total)}）`,
+                pct
+            );
+        };
+        xhr.onload = () => {
+            let parsed = {};
+            try {
+                parsed = JSON.parse(xhr.responseText || '{}');
+            } catch {
+                parsed = {};
+            }
+            if (xhr.status >= 200 && xhr.status < 300) {
+                resolve(parsed);
+                return;
+            }
+            reject(new Error(parsed.error || `导入文件失败（HTTP ${xhr.status}）`));
+        };
+        xhr.onerror = () => reject(new Error('上传中断，请检查网络后重试'));
+        xhr.send(file);
     });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) {
-        throw new Error(data.error || '导入文件失败');
+
+    if (data.outputRoot) {
+        lastSuggestedOutput = data.outputRoot;
+        outputRootEl.value = data.outputRoot;
     }
-    setInputPathValue(data.value, { autoOutput: true, forceOutput: false });
-    setProgress(`已导入到 ${data.value}，可开始转换。`);
+    setInputPathValue(data.value, { autoOutput: !data.outputRoot, forceOutput: false });
+    setProgress(`已导入到 ${data.value}，输出目录 ${outputRootEl.value.trim() || data.outputRoot || ''}。`);
     return data;
+};
+
+const ensureOutputDirectory = async () => {
+    const inputPath = inputPathEl.value.trim();
+    let outputRoot = outputRootEl.value.trim();
+    if (!outputRoot && inputPath) {
+        maybeAutoFillOutput(inputPath, { force: true });
+        outputRoot = outputRootEl.value.trim();
+    }
+    if (!outputRoot) return null;
+    try {
+        const res = await fetch('/api/ensure-paths', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                inputPath,
+                outputRoot,
+                mode: currentMode
+            })
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+            throw new Error(data.error || '创建输出目录失败');
+        }
+        if (data.outputRoot && data.outputRoot !== outputRoot) {
+            outputRootEl.value = data.outputRoot;
+            lastSuggestedOutput = data.outputRoot;
+            saveConfigToStorage();
+        }
+        return data;
+    } catch (error) {
+        setProgress(`创建输出目录失败: ${error.message || error}`);
+        return null;
+    }
+};
+
+let ensureOutputTimer = null;
+const scheduleEnsureOutputDirectory = () => {
+    clearTimeout(ensureOutputTimer);
+    ensureOutputTimer = setTimeout(() => {
+        ensureOutputDirectory();
+    }, 350);
+};
+
+const applyAccessModeUi = () => {
+    const inputHint = document.getElementById('inputPathHint');
+    const outputHint = document.getElementById('outputPathHint');
+    const lanBanner = document.getElementById('lanBanner');
+    if (lanBanner) lanBanner.classList.toggle('hidden', localClient);
+    if (inputHint) {
+        inputHint.textContent = localClient
+            ? '可粘贴本机路径、浏览选择或拖入文件。浏览器不提供真实路径时，会上传到服务器 input/文件名/ 目录。'
+            : '局域网访问请拖入或点击上传。文件会保存到服务器 input/文件名/，不能使用你电脑上的本地路径。';
+    }
+    if (outputHint) {
+        outputHint.textContent = localClient
+            ? '导入后按输入文件名自动创建 output/文件名（可手动改）。'
+            : '导入后自动在服务器创建 output/文件名。转换在服务器上完成，结果可在此下载。';
+    }
+    if (pickOutputBtn) {
+        pickOutputBtn.title = localClient ? '浏览选择' : '局域网访问请使用自动生成的输出目录';
+    }
 };
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -2174,13 +2462,14 @@ const rebuildLevelsByCount = (count) => {
 const initializeDefaults = async () => {
     const res = await fetch('/api/defaults');
     const defaults = await res.json();
+    localClient = defaults.localClient !== false;
+    applyAccessModeUi();
 
-    // 1) Server defaults
-    inputPathEl.value = defaults.inputPath;
-    updateInputDropHint(defaults.inputPath);
-    const defaultOut = suggestOutputFromInput(defaults.inputPath) || defaults.outputRoot;
-    outputRootEl.value = defaultOut;
-    lastSuggestedOutput = defaultOut;
+    // 1) Empty path defaults; keep LOD/compress parameter defaults
+    inputPathEl.value = '';
+    updateInputDropHint('');
+    outputRootEl.value = '';
+    lastSuggestedOutput = '';
     if (chunkCountKEl) {
         chunkCountKEl.value = String(Math.max(1, Number(defaults.chunkCountK) || defaults.levels?.[0]?.chunkCountK || 512));
     }
@@ -2199,10 +2488,13 @@ const initializeDefaults = async () => {
     const saved = loadConfigFromStorage();
     if (saved) {
         applyConfigToForm(saved);
-        // If saved input exists but output empty, auto-fill
         if (saved.inputPath && !`${saved.outputRoot || ''}`.trim()) {
             maybeAutoFillOutput(saved.inputPath, { force: true });
         }
+    }
+
+    if (inputPathEl.value.trim()) {
+        scheduleEnsureOutputDirectory();
     }
 
     setWorkflowStep(inputPathEl.value.trim() && outputRootEl.value.trim() ? 2 : 1);
@@ -2220,6 +2512,8 @@ const initializeDefaults = async () => {
         setProgress(`恢复任务状态失败: ${error.message || error}`);
     }
     refreshOutputDownloads();
+    syncCompareImportButtons();
+    updatePreviewChrome();
 };
 
 const pickPath = async (kind) => {
@@ -2240,7 +2534,6 @@ const pickPath = async (kind) => {
 
 const validateBeforeStart = () => {
     const inputPath = inputPathEl.value.trim();
-    const outputRoot = outputRootEl.value.trim();
     if (!inputPath) {
         setProgress('请先选择输入文件（步骤 1）。');
         setWorkflowStep(1);
@@ -2248,6 +2541,10 @@ const validateBeforeStart = () => {
         inputPathEl.focus();
         return null;
     }
+    if (!outputRootEl.value.trim()) {
+        maybeAutoFillOutput(inputPath, { force: true });
+    }
+    const outputRoot = outputRootEl.value.trim();
     if (!outputRoot) {
         setProgress('请先填写输出目录（步骤 1）。');
         setWorkflowStep(1);
@@ -2346,6 +2643,10 @@ stopBtn.addEventListener('click', async () => {
 });
 
 pickInputBtn.addEventListener('click', async () => {
+    if (!localClient) {
+        inputFileHidden?.click();
+        return;
+    }
     try {
         const value = await pickPath('input');
         if (value) {
@@ -2353,11 +2654,24 @@ pickInputBtn.addEventListener('click', async () => {
             setProgress(`已选择输入：${value}`);
         }
     } catch (error) {
+        if (inputFileHidden) {
+            inputFileHidden.click();
+            return;
+        }
         setProgress(`选择输入文件失败: ${error.message || error}`);
     }
 });
 
 pickOutputBtn.addEventListener('click', async () => {
+    if (!localClient) {
+        if (!outputRootEl.value.trim() && inputPathEl.value.trim()) {
+            maybeAutoFillOutput(inputPathEl.value, { force: true });
+        }
+        outputRootEl.focus();
+        setProgress('局域网访问会按输入文件名自动创建 output/文件名，可直接编辑该路径。');
+        scheduleEnsureOutputDirectory();
+        return;
+    }
     try {
         const value = await pickPath('output');
         if (value) {
@@ -2367,6 +2681,7 @@ pickOutputBtn.addEventListener('click', async () => {
             saveConfigToStorage();
             setProgress(`已选择输出：${value}`);
             scheduleRefreshOutputDownloads();
+            scheduleEnsureOutputDirectory();
         }
     } catch (error) {
         setProgress(`选择输出目录失败: ${error.message || error}`);
@@ -2412,95 +2727,201 @@ inputPathEl.addEventListener('change', () => {
     updateInputDropHint(inputPathEl.value);
     maybeAutoFillOutput(inputPathEl.value, { force: false });
     saveConfigToStorage();
+    if (inputPathEl.value.trim()) scheduleEnsureOutputDirectory();
 });
 outputRootEl.addEventListener('change', () => {
     saveConfigToStorage();
     scheduleRefreshOutputDownloads();
 });
 
-const importExistingOutput = async () => {
+const importLodPreviewFromPath = async (rawPath) => {
     if (activeRunId) {
         setProgress('请先等待当前任务结束，再导入预览。');
         return;
     }
-    const root = outputRootEl.value.trim();
-    if (!root) {
-        setProgress('请先填写或选择已有输出目录。');
-        setWorkflowStep(1);
+    const pathValue = `${rawPath ?? ''}`.trim();
+    if (!pathValue) {
+        setProgress('请选择 lod-meta.json，或填写 LOD 目录路径。');
+        lodImportPath?.focus();
         return;
     }
 
     setStatusPhase('导入中', 'run');
-    setProgress('正在导入已有结果…');
-    if (importPreviewBtn) importPreviewBtn.disabled = true;
+    setProgress(`正在导入 LOD：${pathValue}`);
+    updatePreviewChrome();
 
     try {
-        const res = await fetch('/api/open-output', {
+        const res = await fetch('/api/open-preview', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ outputRoot: root })
+            body: JSON.stringify({ kind: 'lod', path: pathValue })
         });
         const data = await res.json();
         if (!res.ok) {
-            throw new Error(data.error || '导入失败');
+            throw new Error(data.error || '导入 LOD 失败');
         }
-
-        if (data.kind === 'lod') {
-            applyWorkMode(WORK_MODE.lod, { syncOutput: false });
-            if (Number(data.lodLevels) > 0) {
-                rebuildLevelsByCount(Number(data.lodLevels));
-            }
-            setWorkflowStep(4);
-            const loaded = await loadFinalLodMeta(data.outputMetaUrl);
-            if (loaded) {
-                setProgress(`已导入 LOD 预览：${root}`, 100);
-            }
-            return;
+        applyWorkMode(WORK_MODE.lod, { syncOutput: false });
+        if (Number(data.lodLevels) > 0) {
+            rebuildLevelsByCount(Number(data.lodLevels));
         }
-
-        if (data.kind === 'compress') {
-            applyWorkMode(WORK_MODE.compress, { syncOutput: false });
-            if (data.keepPercent != null) syncKeepPercentUi(data.keepPercent);
-            setWorkflowStep(4);
-            const loaded = await loadComparePreview(data);
-            if (loaded) {
-                setProgress(`已导入压缩对比预览：${root}`, 100);
-            }
-            return;
+        if (lodImportPath) lodImportPath.value = data.absPath || pathValue;
+        setWorkflowStep(4);
+        const loaded = await loadFinalLodMeta(data.outputMetaUrl);
+        if (loaded) {
+            setProgress(`已导入 LOD 预览：${data.absPath || pathValue}`, 100);
         }
-
-        throw new Error('未识别的输出类型。');
     } catch (error) {
         setStatusPhase('导入失败', 'err');
-        setProgress(`导入预览失败: ${error.message || error}`);
-    } finally {
-        refreshOutputDownloads();
+        setProgress(`导入 LOD 失败: ${error.message || error}`);
+        updatePreviewChrome();
     }
 };
 
-if (importPreviewBtn) {
-    importPreviewBtn.addEventListener('click', () => {
-        importExistingOutput();
+const loadManualComparePreview = async () => {
+    if (activeRunId) {
+        setProgress('请先等待当前任务结束，再导入对比。');
+        return;
+    }
+    if (!compareImportLeft || !compareImportRight) {
+        setProgress('请先选择左侧和右侧两个高斯文件。');
+        return;
+    }
+
+    setStatusPhase('导入中', 'run');
+    setProgress(`正在加载对比：${compareImportLeft.name} / ${compareImportRight.name}`);
+    setWorkflowStep(4);
+
+    const loaded = await loadComparePreview({
+        originalUrl: compareImportLeft.url,
+        compressedUrl: compareImportRight.url,
+        leftLabel: compareImportLeft.name,
+        rightLabel: compareImportRight.name,
+        originalSizeBytes: compareImportLeft.sizeBytes,
+        compressedSizeBytes: compareImportRight.sizeBytes,
+        manualImport: true
+    });
+    if (!loaded) {
+        setStatusPhase('导入失败', 'err');
+    }
+    updatePreviewChrome();
+};
+
+const handleCompareFilePicked = async (file, role) => {
+    if (!file || activeRunId) return;
+    if (!isAcceptedInputName(file.name || '')) {
+        setProgress(`不支持的文件类型：${file.name || '(未知)'}`);
+        return;
+    }
+    try {
+        setStatusPhase('上传中', 'run');
+        const data = await uploadPreviewCompareFile(file, role);
+        const payload = {
+            name: data.name || file.name,
+            url: data.url,
+            sizeBytes: data.sizeBytes,
+            absPath: data.absPath || data.value
+        };
+        if (role === 'left') compareImportLeft = payload;
+        else compareImportRight = payload;
+        syncCompareImportButtons();
+        setStatusPhase('就绪', 'idle');
+        setProgress(`已选择${role === 'left' ? '左侧' : '右侧'}：${payload.name}`);
+    } catch (error) {
+        setStatusPhase('上传失败', 'err');
+        setProgress(`上传失败: ${error.message || error}`);
+        updatePreviewChrome();
+    }
+};
+
+if (compareLeftPickBtn && compareLeftFile) {
+    compareLeftPickBtn.addEventListener('click', () => {
+        if (activeRunId) return;
+        compareLeftFile.click();
+    });
+    compareLeftFile.addEventListener('change', async () => {
+        const file = compareLeftFile.files?.[0];
+        compareLeftFile.value = '';
+        await handleCompareFilePicked(file, 'left');
+    });
+}
+
+if (compareRightPickBtn && compareRightFile) {
+    compareRightPickBtn.addEventListener('click', () => {
+        if (activeRunId) return;
+        compareRightFile.click();
+    });
+    compareRightFile.addEventListener('change', async () => {
+        const file = compareRightFile.files?.[0];
+        compareRightFile.value = '';
+        await handleCompareFilePicked(file, 'right');
+    });
+}
+
+if (compareLoadBtn) {
+    compareLoadBtn.addEventListener('click', () => {
+        loadManualComparePreview();
+    });
+}
+
+if (lodMetaPickBtn) {
+    lodMetaPickBtn.addEventListener('click', async () => {
+        if (activeRunId) return;
+        if (!localClient) {
+            lodImportPath?.focus();
+            setProgress('局域网访问请填写服务器上的 lod-meta.json 或 LOD 目录路径，然后点「导入 LOD」。');
+            return;
+        }
+        try {
+            const value = await pickPath('lod-meta');
+            if (!value) return;
+            if (lodImportPath) lodImportPath.value = value;
+            await importLodPreviewFromPath(value);
+        } catch (error) {
+            setProgress(`选择 lod-meta.json 失败: ${error.message || error}`);
+        }
+    });
+}
+
+if (lodImportBtn) {
+    lodImportBtn.addEventListener('click', async () => {
+        await importLodPreviewFromPath(lodImportPath?.value || '');
+    });
+}
+
+if (clearPreviewBtn) {
+    clearPreviewBtn.addEventListener('click', () => {
+        clearPreviewData();
     });
 }
 
 if (downloadOutputBtn) {
-    downloadOutputBtn.addEventListener('click', () => {
-        const root = outputRootEl.value.trim();
-        if (!root || !outputDownloadPrimary) {
+    downloadOutputBtn.addEventListener('click', (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        if (!outputDownloadOptions.length) {
             setProgress('还没有可下载的结果文件。');
             return;
         }
-        const url = `/api/download-output?root=${encodeURIComponent(root)}&name=${encodeURIComponent(outputDownloadPrimary)}`;
-        const link = document.createElement('a');
-        link.href = url;
-        link.download = outputDownloadPrimary;
-        document.body.appendChild(link);
-        link.click();
-        link.remove();
-        setProgress(`开始下载 ${outputDownloadPrimary}…`);
+        if (outputDownloadOptions.length === 1) {
+            startDownloadOption(outputDownloadOptions[0]);
+            return;
+        }
+        if (downloadMenu && !downloadMenu.classList.contains('hidden')) {
+            hideDownloadMenu();
+            return;
+        }
+        showDownloadMenu(outputDownloadOptions);
     });
 }
+
+document.addEventListener('click', (event) => {
+    if (!downloadMenu || downloadMenu.classList.contains('hidden')) return;
+    const target = event.target;
+    if (target instanceof Node && (downloadMenu.contains(target) || downloadOutputBtn?.contains(target))) {
+        return;
+    }
+    hideDownloadMenu();
+});
 
 // --- Input drag & drop ---
 const setDropZoneActive = (active) => {
@@ -2525,16 +2946,17 @@ const handleDroppedFile = async (file, dt = null) => {
     }
 
     try {
-        const realPath = collectDroppedPath(dt, file);
-        if (realPath) {
-            const data = await resolveDroppedInput(name, realPath);
-            if (data.found && data.value) {
-                setInputPathValue(data.value, { autoOutput: true, forceOutput: false });
-                setProgress(`已选择输入：${data.value}`);
-                return;
+        if (localClient) {
+            const realPath = collectDroppedPath(dt, file);
+            if (realPath) {
+                const data = await resolveDroppedInput(name, realPath);
+                if (data.found && data.value) {
+                    setInputPathValue(data.value, { autoOutput: true, forceOutput: false });
+                    setProgress(`已选择输入：${data.value}`);
+                    return;
+                }
             }
         }
-        // Browser did not expose a usable OS path: copy into workspace input/
         await uploadDroppedFile(file);
     } catch (error) {
         setProgress(`导入失败: ${error.message || error}`);
@@ -2570,6 +2992,10 @@ if (inputDropZone) {
 
         const droppedPath = collectDroppedPath(dt, null);
         if (droppedPath) {
+            if (!localClient) {
+                setProgress('局域网访问请拖入实际文件以上传到服务器，不能使用其他电脑上的路径。');
+                return;
+            }
             const base = basenameFromPath(droppedPath);
             try {
                 await applyResolvedInput(base || droppedPath, droppedPath);
@@ -2583,8 +3009,11 @@ if (inputDropZone) {
 
     inputDropZone.addEventListener('click', () => {
         if (activeRunId) return;
-        // Prefer native OS dialog via server (full path); fall back to file input for name resolve
-        pickInputBtn.click();
+        if (localClient) {
+            pickInputBtn.click();
+            return;
+        }
+        inputFileHidden?.click();
     });
 
     inputDropZone.addEventListener('keydown', (e) => {

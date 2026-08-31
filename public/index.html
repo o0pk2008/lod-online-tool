@@ -3,7 +3,7 @@
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>在线 LOD 转换工具</title>
+    <title>SplatForge</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
@@ -72,57 +72,26 @@
     <div class="h-full flex flex-col overflow-hidden">
         <header class="shrink-0 bg-gradient-to-r from-[#0b5fb9] via-[#1d6feb] to-[#0b5fb9] text-white border-b border-white/10">
             <div class="w-full px-4 py-3 flex items-center gap-4">
-                <div class="flex items-center gap-2 font-semibold">
-                    <span class="inline-flex h-8 w-8 items-center justify-center rounded-xl bg-white/10 ring-1 ring-white/15">
-                        <svg class="h-5 w-5" viewBox="0 0 1024 1024" version="1.1" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+                <div class="flex items-center gap-2.5 shrink-0 min-w-0">
+                    <span class="inline-flex h-8 w-8 items-center justify-center text-white" aria-hidden="true">
+                        <svg class="h-5 w-5" viewBox="0 0 1024 1024" version="1.1" xmlns="http://www.w3.org/2000/svg">
                             <path fill="currentColor" d="M0 0h438.857143v1024H0V0z m512 0h512v438.857143H512V0z m0 512h219.428571v219.428571H512V512z m292.571429 0h219.428571v219.428571h-219.428571V512z m-292.571429 292.571429h73.142857v73.142857H512v-73.142857z m146.285714 0h73.142857v73.142857H658.285714v-73.142857z m-146.285714 146.285714h73.142857v73.142857H512v-73.142857z m146.285714 0h73.142857v73.142857H658.285714v-73.142857z m146.285715 0h73.142857v73.142857h-73.142857v-73.142857z m146.285714 0h73.142857v73.142857h-73.142857v-73.142857z m-146.285714-146.285714h73.142857v73.142857h-73.142857v-73.142857z m146.285714 0h73.142857v73.142857h-73.142857v-73.142857z"></path>
                         </svg>
                     </span>
-                    <span class="text-[16px] md:text-[18px] tracking-[-0.2px]">TwinScape 高斯工具</span>
-                </div>
-
-                <div id="modeSwitch" class="inline-flex rounded-full bg-white/10 p-0.5 ring-1 ring-white/15 shrink-0" role="tablist" aria-label="工作模式">
-                    <button id="modeLodBtn" type="button" data-mode="lod" class="px-3 py-1.5 rounded-full text-[12px] font-semibold bg-white text-[#0b5fb9]">LOD 转换</button>
-                    <button id="modeCompressBtn" type="button" data-mode="compress" class="px-3 py-1.5 rounded-full text-[12px] font-semibold text-white/85 hover:bg-white/10">模型压缩</button>
-                </div>
-
-                <div class="flex-1 hidden md:flex items-center justify-center">
-                    <div id="stepBar" class="flex items-center gap-4 text-[12px] font-semibold tracking-[0.2px]">
-                        <div data-step="1" class="flex items-center gap-2.5 opacity-100">
-                            <span data-step-dot class="inline-flex h-7 w-7 items-center justify-center rounded-full bg-white/20 ring-1 ring-white/40">1</span>
-                            <div class="leading-tight">
-                                <div class="text-white/75 text-[11px] font-medium">步骤 1</div>
-                                <div class="text-[13px]">选择路径</div>
-                            </div>
-                        </div>
-                        <div class="h-px w-10 bg-white/25"></div>
-                        <div data-step="2" class="flex items-center gap-2.5 opacity-70">
-                            <span data-step-dot class="inline-flex h-7 w-7 items-center justify-center rounded-full bg-white/10 ring-1 ring-white/25">2</span>
-                            <div class="leading-tight">
-                                <div class="text-white/75 text-[11px] font-medium">步骤 2</div>
-                                <div class="text-[13px]">设置参数</div>
-                            </div>
-                        </div>
-                        <div class="h-px w-10 bg-white/25"></div>
-                        <div data-step="3" class="flex items-center gap-2.5 opacity-70">
-                            <span data-step-dot class="inline-flex h-7 w-7 items-center justify-center rounded-full bg-white/10 ring-1 ring-white/25">3</span>
-                            <div class="leading-tight">
-                                <div class="text-white/75 text-[11px] font-medium">步骤 3</div>
-                                <div class="text-[13px]">转换任务</div>
-                            </div>
-                        </div>
-                        <div class="h-px w-10 bg-white/25"></div>
-                        <div data-step="4" class="flex items-center gap-2.5 opacity-70">
-                            <span data-step-dot class="inline-flex h-7 w-7 items-center justify-center rounded-full bg-white/10 ring-1 ring-white/25">4</span>
-                            <div class="leading-tight">
-                                <div class="text-white/75 text-[11px] font-medium">步骤 4</div>
-                                <div class="text-[13px]">三维预览</div>
-                            </div>
-                        </div>
+                    <div class="leading-tight">
+                        <div class="text-[16px] md:text-[18px] font-semibold tracking-[-0.2px]">SplatForge</div>
+                        <div class="text-[11px] font-medium text-white/70 tracking-[0.1px]">Gaussian Splatting Toolkit</div>
                     </div>
                 </div>
 
-                <div class="hidden lg:flex items-center gap-2 text-[12px] text-white/80">
+                <div class="flex-1 flex items-center justify-center min-w-0 px-2">
+                    <div id="modeSwitch" class="inline-flex rounded-full bg-white/10 p-0.5 ring-1 ring-white/15 shrink-0" role="tablist" aria-label="工作模式">
+                        <button id="modeLodBtn" type="button" data-mode="lod" class="px-3 py-1.5 rounded-full text-[12px] font-semibold bg-white text-[#0b5fb9]">LOD 转换</button>
+                        <button id="modeCompressBtn" type="button" data-mode="compress" class="px-3 py-1.5 rounded-full text-[12px] font-semibold text-white/85 hover:bg-white/10">模型压缩</button>
+                    </div>
+                </div>
+
+                <div class="flex items-center justify-end gap-2 text-[12px] text-white/80 shrink-0">
                     <button id="helpBtn" type="button" class="inline-flex items-center gap-2 rounded-full bg-white/10 px-3 py-1.5 ring-1 ring-white/15 hover:bg-white/15">
                         <span class="inline-block h-2 w-2 rounded-full bg-emerald-300"></span>
                         <span>操作说明</span>
@@ -142,6 +111,9 @@
                             <p id="pathDesc" class="mt-1 text-[12px] text-[#526077] leading-relaxed">
                                 指定高斯模型与输出目录。流水线为<strong>两段式</strong>（中间 PLY → lod-meta）。
                             </p>
+                            <div id="lanBanner" class="hidden mt-2 rounded-lg bg-[#eef6ff] px-2.5 py-2 text-[11px] text-[#0b5fb9] leading-relaxed ring-1 ring-[#1d6feb]/20">
+                                当前是局域网访问：请把文件上传到服务器，转换在服务器上完成，结果用「下载结果」取回。
+                            </div>
                         </div>
 
                         <div class="space-y-3">
@@ -169,8 +141,8 @@
                                     </div>
                                 </div>
 
-                                <input id="inputPath" class="mt-2 w-full border border-[#cfd9ea] bg-white text-[#0b1220] px-3 py-2 rounded-xl focus:outline-none focus:ring-2 focus:ring-[#1d6feb]/20 focus:border-[#1d6feb] text-[13px]" placeholder="例如 input/model.ply 或绝对路径" />
-                                <div class="mt-1.5 text-[11px] text-[#7b8494]">也可粘贴完整路径。拖入时优先使用真实路径；浏览器不提供路径时会导入到仓库 <code class="text-[10px] bg-white px-1 rounded">input/</code></div>
+                                <input id="inputPath" class="mt-2 w-full border border-[#cfd9ea] bg-white text-[#0b1220] px-3 py-2 rounded-xl focus:outline-none focus:ring-2 focus:ring-[#1d6feb]/20 focus:border-[#1d6feb] text-[13px]" placeholder="导入后自动填写" />
+                                <div id="inputPathHint" class="mt-1.5 text-[11px] text-[#7b8494]">导入文件后会上传到服务器，并按文件名创建目录。</div>
                             </div>
 
                             <div class="rounded-xl border border-[#dbe3f0] bg-[#f6f9ff] p-3">
@@ -182,17 +154,16 @@
                                         </svg>
                                     </button>
                                 </div>
-                                <input id="outputRoot" class="mt-2 w-full border border-[#cfd9ea] bg-white text-[#0b1220] px-3 py-2 rounded-xl focus:outline-none focus:ring-2 focus:ring-[#1d6feb]/20 focus:border-[#1d6feb] text-[13px]" placeholder="例如 output/model-name" />
-                                <div class="mt-1.5 text-[11px] text-[#7b8494]">默认随输入文件名自动变为 <code class="text-[10px] bg-white px-1 rounded">output/文件名</code>（可手动改）</div>
-                                <div class="mt-2 grid grid-cols-2 gap-2">
-                                    <button id="importPreviewBtn" type="button" disabled class="h-9 rounded-xl border border-[#cfd9ea] bg-white text-[#0b1220] text-[12px] font-semibold hover:bg-[#f6f9ff] disabled:opacity-40 disabled:cursor-not-allowed">
-                                        导入预览
-                                    </button>
-                                    <button id="downloadOutputBtn" type="button" disabled class="h-9 rounded-xl bg-[#0b1220] text-white text-[12px] font-semibold hover:opacity-90 disabled:opacity-40 disabled:cursor-not-allowed">
+                                <input id="outputRoot" class="mt-2 w-full border border-[#cfd9ea] bg-white text-[#0b1220] px-3 py-2 rounded-xl focus:outline-none focus:ring-2 focus:ring-[#1d6feb]/20 focus:border-[#1d6feb] text-[13px]" placeholder="导入后自动创建" />
+                                <div id="outputPathHint" class="mt-1.5 text-[11px] text-[#7b8494]">导入后按输入文件名自动创建 <code class="text-[10px] bg-white px-1 rounded">output/文件名</code>（可手动改）</div>
+                                <div class="mt-2 relative">
+                                    <button id="downloadOutputBtn" type="button" disabled class="h-9 w-full rounded-xl bg-[#0b1220] text-white text-[12px] font-semibold hover:opacity-90 disabled:opacity-40 disabled:cursor-not-allowed">
                                         下载结果
                                     </button>
+                                    <div id="downloadMenu" class="hidden absolute right-0 left-0 z-20 mt-1 overflow-hidden rounded-xl border border-[#dbe3f0] bg-white shadow-[0_12px_28px_rgba(12,28,60,0.16)]">
+                                    </div>
                                 </div>
-                                <div id="downloadOutputHint" class="mt-1.5 text-[11px] text-[#7b8494]">已有结果可直接导入预览，不必重新转换</div>
+                                <div id="downloadOutputHint" class="mt-1.5 text-[11px] text-[#7b8494]">转换完成后可在此下载结果</div>
                             </div>
                         </div>
                     </section>
@@ -327,13 +298,44 @@
                             <div class="text-white/80">LOD <span id="currentLod" class="text-white font-semibold">-</span> · 块 <span id="chunkCount" class="text-white font-semibold">0</span></div>
                             <div id="viewModeLabel" class="text-white/60 text-[11px] mt-0.5">等待数据</div>
                         </div>
-                        <div class="absolute top-3 right-3 z-10 flex gap-2">
+                        <div class="absolute top-3 right-3 z-10 flex flex-col items-stretch gap-2">
                             <button id="lodDebugBtn" type="button" class="hidden px-3 py-1.5 rounded-lg bg-white/10 text-white text-[12px] font-medium backdrop-blur ring-1 ring-white/15 hover:bg-white/15" title="LOD 调试着色">
                                 LOD 调试
                             </button>
                             <button id="resetCameraBtn" type="button" class="px-3 py-1.5 rounded-lg bg-white/10 text-white text-[12px] font-medium backdrop-blur ring-1 ring-white/15 hover:bg-white/15" title="重置视角">
                                 重置视角
                             </button>
+                            <button id="clearPreviewBtn" type="button" class="hidden px-3 py-1.5 rounded-lg bg-white/10 text-white text-[12px] font-medium backdrop-blur ring-1 ring-white/15 hover:bg-rose-500/30 hover:ring-rose-300/30" title="清空已加载的预览数据">
+                                清空数据
+                            </button>
+                        </div>
+                        <div id="previewEmptyState" class="absolute inset-0 z-[9] flex items-center justify-center p-5 bg-[#070d18]/55 backdrop-blur-[1px]">
+                            <div class="w-full max-w-2xl rounded-2xl border border-white/10 bg-[#121a2b]/92 shadow-[0_18px_40px_rgba(0,0,0,0.35)] p-4 text-white">
+                                <div class="text-[14px] font-semibold">导入预览</div>
+                                <p class="mt-1 text-[12px] text-white/65 leading-relaxed">当前视口为空。可导入两个高斯文件左右对比，或导入一个 <code class="text-[11px] bg-white/10 px-1 rounded">lod-meta.json</code> 查看分层 LOD。</p>
+                                <div class="mt-3 grid grid-cols-1 sm:grid-cols-2 gap-3">
+                                    <div class="rounded-xl border border-white/10 bg-white/5 p-3">
+                                        <div class="text-[12px] font-semibold">对比两个高斯</div>
+                                        <p class="mt-1 text-[11px] text-white/55 leading-relaxed">分别选择左侧 / 右侧模型（.ply / .sog 等）</p>
+                                        <div class="mt-3 space-y-2">
+                                            <button id="compareLeftPickBtn" type="button" class="h-9 w-full rounded-lg bg-white/10 text-[12px] font-semibold hover:bg-white/15 ring-1 ring-white/10 truncate px-3">选择左侧文件</button>
+                                            <button id="compareRightPickBtn" type="button" class="h-9 w-full rounded-lg bg-white/10 text-[12px] font-semibold hover:bg-white/15 ring-1 ring-white/10 truncate px-3">选择右侧文件</button>
+                                            <button id="compareLoadBtn" type="button" disabled class="h-9 w-full rounded-lg bg-[#1d6feb] text-[12px] font-semibold hover:bg-[#185fc9] disabled:opacity-40 disabled:cursor-not-allowed">开始对比</button>
+                                        </div>
+                                    </div>
+                                    <div class="rounded-xl border border-white/10 bg-white/5 p-3">
+                                        <div class="text-[12px] font-semibold">导入 LOD</div>
+                                        <p class="mt-1 text-[11px] text-white/55 leading-relaxed">选择 <code class="text-[10px] bg-white/10 px-1 rounded">lod-meta.json</code>，或填写服务器上的 LOD 目录路径</p>
+                                        <div class="mt-3 space-y-2">
+                                            <button id="lodMetaPickBtn" type="button" class="h-9 w-full rounded-lg bg-white/10 text-[12px] font-semibold hover:bg-white/15 ring-1 ring-white/10">选择 lod-meta.json</button>
+                                            <input id="lodImportPath" class="h-9 w-full rounded-lg bg-[#0b1220] text-white text-[12px] px-3 ring-1 ring-white/15 focus:outline-none focus:ring-[#1d6feb]/50 placeholder:text-white/35" placeholder="例如 output/scene 或绝对路径" />
+                                            <button id="lodImportBtn" type="button" class="h-9 w-full rounded-lg bg-[#1d6feb] text-[12px] font-semibold hover:bg-[#185fc9]">导入 LOD</button>
+                                        </div>
+                                    </div>
+                                </div>
+                                <input id="compareLeftFile" type="file" accept=".ply,.sog,.splat,.spz,.ksplat,.compressed.ply" class="hidden" />
+                                <input id="compareRightFile" type="file" accept=".ply,.sog,.splat,.spz,.ksplat,.compressed.ply" class="hidden" />
+                            </div>
                         </div>
                         <div id="lodDebugPanel" class="hidden absolute bottom-14 right-3 z-10 w-[250px] rounded-xl bg-black/60 text-white backdrop-blur ring-1 ring-white/15 p-3 pointer-events-auto">
                             <div class="text-[12px] font-semibold mb-2">LOD 调试</div>
@@ -390,14 +392,14 @@
             </div>
             <div class="px-5 py-4 text-[13px] text-[#3b4453] space-y-3 leading-relaxed">
                 <p>顶部可切换 <strong>LOD 转换</strong> 与 <strong>模型压缩</strong>，步骤同为：路径 → 参数 → 转换 → 预览。</p>
-                <p><strong>1. 选择路径</strong>：指定高斯模型与输出目录（最左侧栏）。</p>
+                <p><strong>1. 选择路径</strong>：导入高斯模型。输入/输出默认留空，导入后按文件名自动创建 <code class="bg-[#f2f6fb] px-1 rounded">input/文件名/</code> 与 <code class="bg-[#f2f6fb] px-1 rounded">output/文件名</code>。局域网其他电脑请上传文件，完成后下载结果。</p>
                 <p><strong>2. 设置参数</strong>：LOD 模式设置层数/保留率/分块；压缩模式只需设置保留比例（例如 60% 即压缩到原来的六成）。</p>
                 <p><strong>3. 转换任务</strong>：在参数栏右侧查看进度，点击「开始转换」或「开始压缩」。</p>
                 <ul class="list-disc pl-5 space-y-1 text-[12px]">
                     <li><strong>LOD</strong>：阶段1 生成中间 PLY，阶段2 合成 <code class="bg-[#f2f6fb] px-1 rounded">lod-meta.json</code> 与分块</li>
                     <li><strong>压缩</strong>：按保留比例简化，输出单个 <code class="bg-[#f2f6fb] px-1 rounded">compressed.ply</code></li>
                 </ul>
-                <p><strong>4. 三维预览</strong>：LOD 完成后加载分层流式 <code class="bg-[#f2f6fb] px-1 rounded">lod-meta.json</code>（可打开「LOD 调试」按层级着色）；压缩完成后可拖动中间分割线对比原始 / 压缩后。已转换过的目录可在步骤 1 点「导入预览」直接加载。</p>
+                <p><strong>4. 三维预览</strong>：转换完成后自动加载。视口为空时可导入两个高斯文件做左右对比，或导入 <code class="bg-[#f2f6fb] px-1 rounded">lod-meta.json</code> 查看分层 LOD。已有模型时可点「清空数据」。</p>
                 <p class="text-[#7b8494] text-[12px]">提示：已有结果会跳过（断点续跑）。全量重算请先清空输出目录。</p>
             </div>
             <div class="px-5 py-3 border-t border-[#e8eef7] flex justify-end">

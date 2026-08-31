@@ -2,6 +2,7 @@ import { spawn } from 'node:child_process';
 import { createReadStream, createWriteStream, existsSync } from 'node:fs';
 import { access, mkdir, open, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import http from 'node:http';
+import os from 'node:os';
 import path from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import { createRequire } from 'node:module';
@@ -17,7 +18,10 @@ const require = createRequire(import.meta.url);
  */
 const repoRoot = path.resolve(__dirname);
 const publicDir = path.join(__dirname, 'public');
+const inputWorkspaceRoot = path.join(repoRoot, 'input');
+const outputWorkspaceRoot = path.join(repoRoot, 'output');
 const port = Number(process.env.PORT || 5178);
+const listenHost = process.env.HOST || '0.0.0.0';
 
 /**
  * Locate @playcanvas/splat-transform (or a local checkout) that provides bin/cli.mjs.
@@ -136,6 +140,111 @@ const sanitizeUploadFileName = (fileName) => {
     const base = path.basename(`${fileName ?? ''}`.trim() || 'upload.ply');
     const cleaned = base.replace(/[<>:"/\\|?*\u0000-\u001f]/g, '_');
     return cleaned || 'upload.ply';
+};
+
+const sanitizeFolderName = (name) => {
+    const cleaned = `${name ?? ''}`
+        .trim()
+        .replace(/[<>:"/\\|?*\u0000-\u001f]/g, '_')
+        .replace(/\s+/g, '_')
+        .replace(/_+/g, '_')
+        .replace(/^\.+/, '')
+        .replace(/\.+$/, '');
+    return cleaned || 'model';
+};
+
+const stemFromFileName = (fileName) => {
+    let name = path.basename(`${fileName ?? ''}`.trim() || 'model');
+    const lower = name.toLowerCase();
+    if (lower.endsWith('.compressed.ply')) {
+        name = name.slice(0, -'.compressed.ply'.length);
+    } else {
+        const ext = path.extname(name);
+        if (ext) name = name.slice(0, -ext.length);
+    }
+    return sanitizeFolderName(name);
+};
+
+const suggestOutputRel = (inputPath, mode) => {
+    const stem = stemFromFileName(inputPath);
+    const folder = mode === 'compress' ? `${stem}-compressed` : stem;
+    return path.posix.join('output', folder);
+};
+
+const toRepoRel = (absPath) => path.relative(repoRoot, absPath).replaceAll('\\', '/');
+
+const getRequestIp = (req) => {
+    const addr = `${req?.socket?.remoteAddress ?? ''}`.trim();
+    return addr.replace(/^::ffff:/i, '');
+};
+
+const isLocalClient = (req) => {
+    const ip = getRequestIp(req);
+    if (ip === '127.0.0.1' || ip === '::1' || ip === 'localhost' || ip === '') return true;
+    return listLanAddresses().includes(ip);
+};
+
+const listLanAddresses = () => {
+    const out = [];
+    const ifaces = os.networkInterfaces();
+    for (const list of Object.values(ifaces || {})) {
+        for (const info of list || []) {
+            const family = `${info.family}`;
+            if (info.internal) continue;
+            if (family !== 'IPv4' && family !== '4') continue;
+            if (info.address) out.push(info.address);
+        }
+    }
+    return out;
+};
+
+const resolveRunPaths = async (payload, mode) => {
+    const localClient = payload.localClient !== false;
+    const inputPath = `${payload.inputPath ?? ''}`.trim();
+    if (!inputPath) {
+        throw new Error('请先选择输入文件。');
+    }
+
+    let outputRoot = `${payload.outputRoot ?? ''}`.trim();
+    if (!outputRoot) {
+        outputRoot = suggestOutputRel(inputPath, mode);
+    }
+
+    const inputAbsPath = path.isAbsolute(inputPath) ? path.resolve(inputPath) : path.resolve(repoRoot, inputPath);
+    let outputRootAbsPath = path.isAbsolute(outputRoot) ? path.resolve(outputRoot) : path.resolve(repoRoot, outputRoot);
+
+    if (!localClient) {
+        if (!isPathInside(inputAbsPath, inputWorkspaceRoot)) {
+            throw new Error('局域网访问请先把文件上传到本工具（拖入或点击选择），不能使用其他电脑上的本地路径。');
+        }
+        if (!isPathInside(outputRootAbsPath, outputWorkspaceRoot)) {
+            outputRoot = suggestOutputRel(inputPath, mode);
+            outputRootAbsPath = path.resolve(repoRoot, outputRoot);
+        }
+    }
+
+    const inputStat = await stat(inputAbsPath).catch(() => null);
+    if (!inputStat || !inputStat.isFile()) {
+        throw new Error(
+            localClient
+                ? `找不到输入文件：${inputAbsPath}。请确认路径存在，或把文件拖入上传。`
+                : '找不到已上传的输入文件。局域网访问请重新拖入或选择文件上传到服务器。'
+        );
+    }
+
+    await mkdir(outputRootAbsPath, { recursive: true });
+
+    const outputRootDisplay = isPathInside(outputRootAbsPath, repoRoot)
+        ? toRepoRel(outputRootAbsPath)
+        : outputRootAbsPath;
+
+    return {
+        inputAbsPath,
+        outputRootAbsPath,
+        inputPathDisplay: isPathInside(inputAbsPath, repoRoot) ? toRepoRel(inputAbsPath) : inputPath,
+        outputRootDisplay,
+        inputStat
+    };
 };
 
 /** Accept Windows paths, POSIX paths, and file:/// URLs from Explorer drag-drop. */
@@ -1190,22 +1299,13 @@ const startLodRun = async (payload) => {
         ? Number(payload.chunkExtent)
         : null;
 
-    const inputPath = `${payload.inputPath ?? ''}`.trim();
-    const outputRoot = `${payload.outputRoot ?? 'output/live-lod'}`.trim();
-
-    if (!inputPath) {
-        throw new Error('请先选择输入文件。');
-    }
-
-    const inputAbsPath = path.isAbsolute(inputPath) ? inputPath : path.resolve(repoRoot, inputPath);
-    const outputRootAbsPath = path.isAbsolute(outputRoot) ? outputRoot : path.resolve(repoRoot, outputRoot);
-
-    const inputStat = await stat(inputAbsPath).catch(() => null);
-    if (!inputStat || !inputStat.isFile()) {
-        throw new Error(`找不到输入文件：${inputAbsPath}。请确认路径存在，或把文件放到仓库 input/ 目录。`);
-    }
-
-    await mkdir(outputRootAbsPath, { recursive: true });
+    const {
+        inputAbsPath,
+        outputRootAbsPath,
+        inputPathDisplay,
+        outputRootDisplay
+    } = await resolveRunPaths(payload, 'lod');
+    const outputRoot = outputRootDisplay;
 
     const runState = {
         runId: `run-${Date.now()}`,
@@ -1221,8 +1321,8 @@ const startLodRun = async (payload) => {
         currentChunkName: null,
         outputRootAbsPath,
         inputAbsPath,
-        inputPathDisplay: inputPath,
-        outputRootDisplay: outputRoot,
+        inputPathDisplay,
+        outputRootDisplay,
         levels: normalizedLevels,
         chunkCountK,
         chunkExtent,
@@ -1467,22 +1567,14 @@ const startCompressRun = async (payload) => {
     const keepPercent = clampKeepPercent(payload.keepPercent);
     const decimateArg = `${keepPercent}%`;
 
-    const inputPath = `${payload.inputPath ?? ''}`.trim();
-    const outputRoot = `${payload.outputRoot ?? 'output/compressed'}`.trim();
-
-    if (!inputPath) {
-        throw new Error('请先选择输入文件。');
-    }
-
-    const inputAbsPath = path.isAbsolute(inputPath) ? inputPath : path.resolve(repoRoot, inputPath);
-    const outputRootAbsPath = path.isAbsolute(outputRoot) ? outputRoot : path.resolve(repoRoot, outputRoot);
-
-    const inputStat = await stat(inputAbsPath).catch(() => null);
-    if (!inputStat || !inputStat.isFile()) {
-        throw new Error(`找不到输入文件：${inputAbsPath}。请确认路径存在，或把文件放到仓库 input/ 目录。`);
-    }
-
-    await mkdir(outputRootAbsPath, { recursive: true });
+    const {
+        inputAbsPath,
+        outputRootAbsPath,
+        inputPathDisplay,
+        outputRootDisplay,
+        inputStat
+    } = await resolveRunPaths(payload, 'compress');
+    const outputRoot = outputRootDisplay;
 
     const compressedFileName = COMPRESS_FILENAME;
     const outPath = path.join(outputRootAbsPath, compressedFileName);
@@ -1501,8 +1593,8 @@ const startCompressRun = async (payload) => {
         currentChunkName: null,
         outputRootAbsPath,
         inputAbsPath,
-        inputPathDisplay: inputPath,
-        outputRootDisplay: outputRoot,
+        inputPathDisplay,
+        outputRootDisplay,
         levels: [],
         keepPercent,
         compressedFileName,
@@ -1785,6 +1877,85 @@ if ($ok -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Write($dlg.Fil
     return runPowerShellPick(script);
 };
 
+const pickLodMetaFile = async () => {
+    const script = `
+Add-Type -AssemblyName System.Windows.Forms
+$dlg = New-Object System.Windows.Forms.OpenFileDialog
+$dlg.Filter = "LOD Meta (lod-meta.json)|lod-meta.json|JSON Files (*.json)|*.json|All Files (*.*)|*.*"
+$dlg.FileName = "lod-meta.json"
+$dlg.Multiselect = $false
+$ok = $dlg.ShowDialog()
+if ($ok -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Write($dlg.FileName) }
+`;
+    return runPowerShellPick(script);
+};
+
+const resolveLodPreviewRoot = async (rawPath) => {
+    const text = `${rawPath ?? ''}`.trim();
+    if (!text) {
+        throw new Error('请提供 lod-meta.json 或 LOD 输出目录路径。');
+    }
+    const abs = path.isAbsolute(text) ? path.resolve(text) : path.resolve(repoRoot, text);
+    const st = await stat(abs).catch(() => null);
+    if (!st) {
+        throw new Error(`找不到路径：${abs}`);
+    }
+
+    let rootAbs = abs;
+    if (st.isFile()) {
+        if (path.basename(abs).toLowerCase() !== 'lod-meta.json') {
+            throw new Error('请选择 lod-meta.json，或包含该文件的 LOD 输出目录。');
+        }
+        rootAbs = path.dirname(abs);
+    } else if (!st.isDirectory()) {
+        throw new Error(`无效路径：${abs}`);
+    }
+
+    const metaAbs = path.join(rootAbs, 'lod-meta.json');
+    const metaStat = await stat(metaAbs).catch(() => null);
+    if (!metaStat?.isFile()) {
+        throw new Error(`目录中没有 lod-meta.json：${rootAbs}`);
+    }
+
+    const base = makeServedOutputBase(rootAbs);
+    let lodLevels = null;
+    try {
+        const parsed = JSON.parse(await readFile(metaAbs, 'utf-8'));
+        lodLevels = Number(parsed?.lodLevels);
+        if (!Number.isFinite(lodLevels) || lodLevels <= 0) lodLevels = null;
+    } catch {
+        lodLevels = null;
+    }
+
+    return {
+        absPath: rootAbs,
+        metaPath: metaAbs,
+        outputMetaUrl: `${base}/lod-meta.json`,
+        lodLevels
+    };
+};
+
+const resolveComparePreviewFile = async (rawPath, label) => {
+    const text = `${rawPath ?? ''}`.trim();
+    if (!text) {
+        throw new Error(`请提供${label}文件路径。`);
+    }
+    const abs = path.isAbsolute(text) ? path.resolve(text) : path.resolve(repoRoot, text);
+    const st = await stat(abs).catch(() => null);
+    if (!st?.isFile()) {
+        throw new Error(`找不到${label}文件：${abs}`);
+    }
+    if (!isAcceptedInputFileName(path.basename(abs))) {
+        throw new Error(`${label}文件类型不支持：${path.basename(abs)}`);
+    }
+    return {
+        absPath: abs,
+        name: path.basename(abs),
+        url: makeInputPreviewUrl(abs),
+        sizeBytes: st.size
+    };
+};
+
 const pickOutputFolder = async () => {
     const script = `
 Add-Type -AssemblyName System.Windows.Forms
@@ -1840,6 +2011,35 @@ const serveDownload = async (res, filePath, downloadName) => {
     }
 };
 
+const zipOutputFolder = async (dirAbs, zipAbs) => {
+    await rm(zipAbs, { force: true });
+    await mkdir(path.dirname(zipAbs), { recursive: true });
+    const args = [
+        '-a',
+        '-c',
+        '-f', zipAbs,
+        '--exclude=_intermediates',
+        '--exclude=_intermediates/*',
+        '-C', dirAbs,
+        '.'
+    ];
+    await new Promise((resolve, reject) => {
+        const child = spawn('tar', args, { windowsHide: true });
+        let stderr = '';
+        child.stderr.on('data', (chunk) => {
+            stderr += chunk.toString();
+        });
+        child.on('error', reject);
+        child.on('close', (code) => {
+            if (code === 0) {
+                resolve();
+                return;
+            }
+            reject(new Error(stderr.trim() || `打包失败（tar 退出码 ${code}）`));
+        });
+    });
+};
+
 const resolveDownloadOutputRoot = (outputRoot) => {
     const text = `${outputRoot ?? ''}`.trim();
     if (!text) {
@@ -1861,6 +2061,54 @@ const pickPrimaryOutputFile = (names) => {
     const ply = names.find((n) => n.toLowerCase().endsWith('.ply') && !n.toLowerCase().includes('preview'));
     if (ply) return ply;
     return names[0] || null;
+};
+
+const buildDownloadOptions = (inspected) => {
+    if (!inspected?.kind) return [];
+    if (inspected.kind === 'lod') {
+        return [{
+            id: 'lod-zip',
+            label: 'LOD ZIP 包',
+            hint: '不含中间 PLY',
+            format: 'zip',
+            name: null
+        }];
+    }
+    if (inspected.kind !== 'compress') return [];
+
+    const files = Array.isArray(inspected.files) ? inspected.files : [];
+    const byLower = new Map(files.map((f) => [f.name.toLowerCase(), f]));
+    const options = [];
+    const ply = byLower.get('compressed.ply');
+    if (ply) {
+        options.push({
+            id: 'compress-ply',
+            label: '压缩 PLY',
+            hint: formatBytesHint(ply.sizeBytes),
+            format: 'file',
+            name: ply.name
+        });
+    }
+    const sog = byLower.get(PREVIEW_COMPRESSED_SOG.toLowerCase());
+    if (sog) {
+        options.push({
+            id: 'compress-sog',
+            label: '压缩 SOG',
+            hint: formatBytesHint(sog.sizeBytes),
+            format: 'file',
+            name: sog.name
+        });
+    }
+    return options;
+};
+
+const formatBytesHint = (sizeBytes) => {
+    const n = Number(sizeBytes);
+    if (!Number.isFinite(n) || n < 0) return '';
+    if (n < 1024) return `${n} B`;
+    if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+    if (n < 1024 * 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+    return `${(n / (1024 * 1024 * 1024)).toFixed(2)} GB`;
 };
 
 const makeServedOutputBase = (absDir) => {
@@ -1992,16 +2240,20 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === 'GET' && reqUrl.pathname === '/api/defaults') {
+        const localClient = isLocalClient(req);
         sendJson(res, 200, {
-            inputPath: 'input/example.ply',
-            outputRoot: 'output/example',
+            inputPath: '',
+            outputRoot: '',
             levels: DEFAULT_LEVELS,
             chunkCountK: 512,
             chunkExtent: 16,
             pipeline: 'two-phase',
             mode: 'lod',
             keepPercent: DEFAULT_KEEP_PERCENT,
-            splatTransformRoot
+            splatTransformRoot,
+            localClient,
+            lanAddresses: listLanAddresses(),
+            port
         });
         return;
     }
@@ -2009,6 +2261,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'POST' && reqUrl.pathname === '/api/start') {
         try {
             const body = await parseBody(req);
+            body.localClient = isLocalClient(req);
             const launched = await startRun(body);
             sendJson(res, 200, { ok: true, runId: launched.runId, mode: launched.mode });
         } catch (error) {
@@ -2096,14 +2349,16 @@ const server = http.createServer(async (req, res) => {
                 return;
             }
 
-            const inputDir = path.join(repoRoot, 'input');
+            const stem = stemFromFileName(fileName);
+            const inputDir = path.join(inputWorkspaceRoot, stem);
             await mkdir(inputDir, { recursive: true });
             const destAbs = path.join(inputDir, fileName);
-            if (!isPathInside(destAbs, inputDir)) {
+            if (!isPathInside(destAbs, inputWorkspaceRoot)) {
                 sendJson(res, 400, { error: 'Invalid upload path' });
                 return;
             }
 
+            req.setTimeout(0);
             await pipeline(req, createWriteStream(destAbs));
             const st = await stat(destAbs).catch(() => null);
             if (!st?.isFile() || st.size <= 0) {
@@ -2111,11 +2366,59 @@ const server = http.createServer(async (req, res) => {
                 return;
             }
 
+            const mode = `${reqUrl.searchParams.get('mode') ?? ''}`.trim() === 'compress' ? 'compress' : 'lod';
+            const outputRoot = suggestOutputRel(fileName, mode);
+            const outputAbs = path.resolve(repoRoot, outputRoot);
+            await mkdir(outputAbs, { recursive: true });
+
             sendJson(res, 200, {
                 ok: true,
-                value: `input/${fileName}`.replaceAll('\\', '/'),
+                value: toRepoRel(destAbs),
                 absPath: destAbs,
-                sizeBytes: st.size
+                sizeBytes: st.size,
+                stem,
+                outputRoot,
+                outputAbsPath: outputAbs
+            });
+        } catch (error) {
+            sendJson(res, 500, { error: error instanceof Error ? error.message : String(error) });
+        }
+        return;
+    }
+
+    if (req.method === 'POST' && reqUrl.pathname === '/api/ensure-paths') {
+        try {
+            const body = await parseBody(req);
+            const mode = `${body.mode ?? ''}`.trim() === 'compress' ? 'compress' : 'lod';
+            const inputPath = `${body.inputPath ?? ''}`.trim();
+            let outputRoot = `${body.outputRoot ?? ''}`.trim();
+            if (!outputRoot && inputPath) {
+                outputRoot = suggestOutputRel(inputPath, mode);
+            }
+            if (!outputRoot) {
+                sendJson(res, 400, { error: '缺少输出目录' });
+                return;
+            }
+
+            const abs = path.isAbsolute(outputRoot) ? path.resolve(outputRoot) : path.resolve(repoRoot, outputRoot);
+            const localClient = isLocalClient(req);
+            if (!localClient && !isPathInside(abs, outputWorkspaceRoot)) {
+                const fallback = suggestOutputRel(inputPath || outputRoot, mode);
+                const fallbackAbs = path.resolve(repoRoot, fallback);
+                await mkdir(fallbackAbs, { recursive: true });
+                sendJson(res, 200, {
+                    ok: true,
+                    outputRoot: fallback,
+                    absPath: fallbackAbs
+                });
+                return;
+            }
+
+            await mkdir(abs, { recursive: true });
+            sendJson(res, 200, {
+                ok: true,
+                outputRoot: isPathInside(abs, repoRoot) ? toRepoRel(abs) : abs,
+                absPath: abs
             });
         } catch (error) {
             sendJson(res, 500, { error: error instanceof Error ? error.message : String(error) });
@@ -2133,6 +2436,7 @@ const server = http.createServer(async (req, res) => {
                 return;
             }
             const inspected = await inspectOutputFolder(abs);
+            const downloadOptions = buildDownloadOptions(inspected);
             sendJson(res, 200, {
                 ok: true,
                 exists: true,
@@ -2142,7 +2446,9 @@ const server = http.createServer(async (req, res) => {
                 kind: inspected.kind,
                 canPreview: inspected.canPreview,
                 lodLevels: inspected.lodLevels,
-                keepPercent: inspected.keepPercent
+                keepPercent: inspected.keepPercent,
+                downloadOptions,
+                downloadKind: downloadOptions[0]?.format || null
             });
         } catch (error) {
             sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) });
@@ -2215,14 +2521,22 @@ const server = http.createServer(async (req, res) => {
         try {
             const outputRoot = `${reqUrl.searchParams.get('root') ?? ''}`.trim();
             const requested = path.basename(`${reqUrl.searchParams.get('name') ?? ''}`.trim());
+            const wantZip = `${reqUrl.searchParams.get('format') ?? ''}`.trim().toLowerCase() === 'zip';
             const abs = resolveDownloadOutputRoot(outputRoot);
             const dirStat = await stat(abs).catch(() => null);
             if (!dirStat?.isDirectory()) {
                 sendJson(res, 404, { error: `输出目录不存在：${abs}` });
                 return;
             }
-            const files = await listOutputFiles(abs);
-            const names = files.map((f) => f.name);
+            const inspected = await inspectOutputFolder(abs);
+            const folder = path.basename(abs) || 'output';
+            if (wantZip || inspected.kind === 'lod') {
+                const zipAbs = path.join(path.dirname(abs), `${folder}.zip`);
+                await zipOutputFolder(abs, zipAbs);
+                await serveDownload(res, zipAbs, `${folder}.zip`);
+                return;
+            }
+            const names = inspected.files.map((f) => f.name);
             const fileName = requested || pickPrimaryOutputFile(names);
             if (!fileName || !names.includes(fileName)) {
                 sendJson(res, 404, { error: '输出目录中还没有可下载的结果文件。' });
@@ -2233,10 +2547,15 @@ const server = http.createServer(async (req, res) => {
                 sendJson(res, 400, { error: 'Invalid file path' });
                 return;
             }
-            const folder = path.basename(abs) || 'output';
-            const downloadName = fileName.toLowerCase() === 'compressed.ply'
-                ? `${folder}.ply`
-                : `${folder}-${fileName}`;
+            const lowerName = fileName.toLowerCase();
+            let downloadName = `${folder}-${fileName}`;
+            if (lowerName === 'compressed.ply') {
+                downloadName = `${folder}.ply`;
+            } else if (lowerName === PREVIEW_COMPRESSED_SOG.toLowerCase()) {
+                downloadName = `${folder}.sog`;
+            } else if (lowerName === PREVIEW_ORIGINAL_SOG.toLowerCase()) {
+                downloadName = `${folder}-original.sog`;
+            }
             await serveDownload(res, target, downloadName);
         } catch (error) {
             sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) });
@@ -2246,14 +2565,25 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === 'POST' && reqUrl.pathname === '/api/pick-path') {
         try {
+            if (!isLocalClient(req)) {
+                sendJson(res, 403, {
+                    error: '局域网访问请在网页里上传文件，不能使用服务器本机的文件对话框。',
+                    useUpload: true
+                });
+                return;
+            }
             const body = await parseBody(req);
             const kind = `${body.kind ?? ''}`.trim();
-            if (!['input', 'output'].includes(kind)) {
-                sendJson(res, 400, { error: 'Invalid kind, expected input or output.' });
+            if (!['input', 'output', 'lod-meta'].includes(kind)) {
+                sendJson(res, 400, { error: 'Invalid kind, expected input, output, or lod-meta.' });
                 return;
             }
 
-            const picked = kind === 'input' ? await pickInputFile() : await pickOutputFolder();
+            const picked = kind === 'input'
+                ? await pickInputFile()
+                : kind === 'lod-meta'
+                    ? await pickLodMetaFile()
+                    : await pickOutputFolder();
             if (!picked) {
                 sendJson(res, 200, { ok: true, cancelled: true });
                 return;
@@ -2272,6 +2602,90 @@ const server = http.createServer(async (req, res) => {
             }
 
             sendJson(res, 200, { ok: true, cancelled: false, value });
+        } catch (error) {
+            sendJson(res, 500, { error: error instanceof Error ? error.message : String(error) });
+        }
+        return;
+    }
+
+    if (req.method === 'POST' && reqUrl.pathname === '/api/open-preview') {
+        try {
+            const body = await parseBody(req);
+            const kind = `${body.kind ?? ''}`.trim();
+            if (kind === 'lod') {
+                const opened = await resolveLodPreviewRoot(body.path);
+                sendJson(res, 200, {
+                    ok: true,
+                    kind: 'lod',
+                    absPath: opened.absPath,
+                    outputMetaUrl: opened.outputMetaUrl,
+                    lodLevels: opened.lodLevels
+                });
+                return;
+            }
+            if (kind === 'compare') {
+                const left = await resolveComparePreviewFile(body.leftPath, '左侧');
+                const right = await resolveComparePreviewFile(body.rightPath, '右侧');
+                sendJson(res, 200, {
+                    ok: true,
+                    kind: 'compare',
+                    originalUrl: left.url,
+                    compressedUrl: right.url,
+                    leftLabel: left.name,
+                    rightLabel: right.name,
+                    originalSizeBytes: left.sizeBytes,
+                    compressedSizeBytes: right.sizeBytes,
+                    manualImport: true
+                });
+                return;
+            }
+            sendJson(res, 400, { error: 'Invalid kind, expected lod or compare.' });
+        } catch (error) {
+            sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) });
+        }
+        return;
+    }
+
+    if (req.method === 'POST' && reqUrl.pathname === '/api/preview-upload') {
+        try {
+            const role = `${reqUrl.searchParams.get('role') ?? 'left'}`.trim().toLowerCase();
+            if (!['left', 'right'].includes(role)) {
+                sendJson(res, 400, { error: 'role must be left or right' });
+                return;
+            }
+            const rawName = reqUrl.searchParams.get('name')
+                || `${req.headers['x-file-name'] ?? ''}`;
+            const fileName = sanitizeUploadFileName(decodeURIComponent(rawName));
+            if (!isAcceptedInputFileName(fileName)) {
+                sendJson(res, 400, { error: `不支持的文件类型：${fileName}` });
+                return;
+            }
+
+            const previewRoot = path.join(inputWorkspaceRoot, '_preview');
+            await mkdir(previewRoot, { recursive: true });
+            const destAbs = path.join(previewRoot, `${role}-${Date.now()}-${fileName}`);
+            if (!isPathInside(destAbs, previewRoot)) {
+                sendJson(res, 400, { error: 'Invalid upload path' });
+                return;
+            }
+
+            req.setTimeout(0);
+            await pipeline(req, createWriteStream(destAbs));
+            const st = await stat(destAbs).catch(() => null);
+            if (!st?.isFile() || st.size <= 0) {
+                sendJson(res, 500, { error: '预览文件上传失败，未写入内容。' });
+                return;
+            }
+
+            sendJson(res, 200, {
+                ok: true,
+                role,
+                name: fileName,
+                absPath: destAbs,
+                value: toRepoRel(destAbs),
+                url: makeInputPreviewUrl(destAbs),
+                sizeBytes: st.size
+            });
         } catch (error) {
             sendJson(res, 500, { error: error instanceof Error ? error.message : String(error) });
         }
@@ -2335,8 +2749,20 @@ const server = http.createServer(async (req, res) => {
     sendJson(res, 404, { error: 'Not found' });
 });
 
-server.listen(port, () => {
-    console.log(`LOD online tool running at http://localhost:${port}`);
+server.requestTimeout = 0;
+server.headersTimeout = 0;
+server.timeout = 0;
+server.listen(port, listenHost, () => {
+    console.log(`LOD online tool running at:`);
+    console.log(`  local : http://localhost:${port}`);
+    const lanIps = listLanAddresses();
+    if (lanIps.length === 0) {
+        console.log(`  lan   : (no IPv4 address found)`);
+    } else {
+        for (const ip of lanIps) {
+            console.log(`  lan   : http://${ip}:${port}`);
+        }
+    }
     console.log(`  workspace : ${repoRoot}`);
     console.log(`  splat-cli : ${splatTransformRoot || '(not found — set SPLAT_TRANSFORM_ROOT)'}`);
 });
