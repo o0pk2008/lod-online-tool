@@ -2786,7 +2786,7 @@ const server = http.createServer(async (req, res) => {
         return;
     }
 
-    if (req.method === 'GET' && ['/app.js', '/chunk-plan.js', '/chunk-plan-worker.js'].includes(reqUrl.pathname)) {
+    if (req.method === 'GET' && ['/app.js', '/chunk-plan.js', '/chunk-plan-worker.js', '/lod-debug.js'].includes(reqUrl.pathname)) {
         await serveFile(res, path.join(publicDir, reqUrl.pathname.slice(1)));
         return;
     }

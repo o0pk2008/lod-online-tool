@@ -13,6 +13,7 @@ import {
     Vec3,
     Vec4
 } from 'playcanvas';
+import { normalizeLodSettings, lodThresholds, distanceLod, lodFovScale, pointBoxDistance, fitLodBase } from './lod-debug.js';
 
 const inputPathEl = document.getElementById('inputPath');
 const outputRootEl = document.getElementById('outputRoot');
@@ -77,6 +78,11 @@ const lodBaseDistanceRange = document.getElementById('lodBaseDistanceRange');
 const lodBaseDistanceVal = document.getElementById('lodBaseDistanceVal');
 const lodMultiplierRange = document.getElementById('lodMultiplierRange');
 const lodMultiplierVal = document.getElementById('lodMultiplierVal');
+const lodBaseDistanceInput = document.getElementById('lodBaseDistanceInput');
+const lodFitDistanceBtn = document.getElementById('lodFitDistanceBtn');
+const lodDistanceInfo = document.getElementById('lodDistanceInfo');
+const lodThresholdInfo = document.getElementById('lodThresholdInfo');
+let lodInfoElapsed = 0;
 const helpBtn = document.getElementById('helpBtn');
 const helpModal = document.getElementById('helpModal');
 const helpCloseBtn = document.getElementById('helpCloseBtn');
@@ -430,12 +436,17 @@ const drawReferenceGrid = () => {
     app.drawLine(new Vec3(0, 0, -size), new Vec3(0, 0, size), axisZ, false);
 };
 
-app.on('update', () => {
+app.on('update', (dt) => {
     drawReferenceGrid();
     if (previewMode === PREVIEW_MODE.source && currentMode === WORK_MODE.lod && showPlanBoxes.checked && planLines.length) {
         app.drawLines(planLines, new Color(0.2, 0.9, 1), false);
     }
     syncCompareCameraTransform();
+    lodInfoElapsed += dt;
+    if (lodInfoElapsed > 0.25 && showingFinalLod && !lodDebugPanel.classList.contains('hidden')) {
+        lodInfoElapsed = 0;
+        updateLodDistanceInfo();
+    }
 });
 
 let isLeftDown = false;
@@ -620,20 +631,21 @@ const unloadGsplatAsset = (entity) => {
 };
 
 const LOD_DEBUG_COLORS = [
-    '#ff3b30',
-    '#34c759',
-    '#007aff',
-    '#ffcc00',
-    '#af52de',
-    '#5ac8fa',
-    '#ff9500',
-    '#8e8e93'
+    '#ff0000',
+    '#00ff00',
+    '#0000ff',
+    '#ffff00',
+    '#ff00ff',
+    '#00ffff',
+    '#ff8000',
+    '#8000ff'
 ];
 
 const DEBUG_LOD = 1;
 const DEBUG_NONE = 0;
 
 const getActiveLodGsplat = () => {
+    if (!showingFinalLod) return null;
     for (let i = chunkEntities.length - 1; i >= 0; i -= 1) {
         if (chunkEntities[i]?.gsplat) return chunkEntities[i].gsplat;
     }
@@ -653,6 +665,10 @@ const setLodColorize = (enabled) => {
 };
 
 const getLodLevelsForDebug = () => {
+    const gsplat = getActiveLodGsplat();
+    const resource = gsplat && app.assets.get(gsplat.asset)?.resource;
+    const count = resource?.octree?.lodLevels;
+    if (Number.isInteger(count) && count > 0) return Array.from({ length: count }, (_, i) => i);
     const lods = (levelState || [])
         .map((level) => Number(level.lod))
         .filter((lod) => Number.isInteger(lod) && lod >= 0);
@@ -681,6 +697,44 @@ const populateLodIsolateSelect = () => {
     lodIsolateSelect.value = [...lodIsolateSelect.options].some((opt) => opt.value === current) ? current : 'all';
 };
 
+const formatLodDistance = (value) => Number(value.toPrecision(4)).toLocaleString('zh-CN', { maximumFractionDigits: 3 });
+
+const getLodDistanceSample = () => {
+    const gsplat = getActiveLodGsplat();
+    const resource = gsplat && app.assets.get(gsplat.asset)?.resource;
+    const octree = resource?.octree;
+    if (!octree?.nodes?.length) return null;
+    const localCamera = gsplat.entity.getWorldTransform().clone().invert().transformPoint(camera.getPosition());
+    const scale = lodFovScale(camera.camera.fov, camera.camera.aspectRatio, camera.camera.horizontalFov);
+    const distances = [];
+    const step = Math.max(1, Math.ceil(octree.nodes.length / 4096));
+    for (let i = 0; i < octree.nodes.length; i += step) {
+        const bounds = octree.nodes[i].bounds;
+        const min = bounds.getMin(), max = bounds.getMax();
+        distances.push(pointBoxDistance([localCamera.x, localCamera.y, localCamera.z],
+            [min.x, min.y, min.z], [max.x, max.y, max.z]) * scale);
+    }
+    return { distances, levels: octree.lodLevels, sampled: step > 1, resource, scale };
+};
+
+const updateLodDistanceInfo = () => {
+    const gsplat = getActiveLodGsplat();
+    const sample = getLodDistanceSample();
+    if (!gsplat || !sample) return;
+    const thresholds = lodThresholds(gsplat.lodBaseDistance, gsplat.lodMultiplier, sample.levels);
+    lodThresholdInfo.textContent = thresholds.length
+        ? thresholds.map((v, i) => `L${i} → L${i + 1}：${formatLodDistance(v)}`).join(' · ')
+        : '当前模型只有 L0，无法切换层级。';
+    const locked = lodIsolateSelect.value !== 'all';
+    const counts = new Map();
+    for (const distance of sample.distances) {
+        const lod = locked ? Number(lodIsolateSelect.value) : distanceLod(distance, thresholds);
+        counts.set(lod, (counts.get(lod) || 0) + 1);
+    }
+    const summary = [...counts].sort((a, b) => a[0] - b[0]).map(([lod, count]) => `L${lod}：${count} 块`).join(' / ');
+    lodDistanceInfo.textContent = `${locked ? '已锁定单层，距离参数暂停作用。' : '自动距离切换。'}有效距离 ${formatLodDistance(Math.min(...sample.distances))}～${formatLodDistance(Math.max(...sample.distances))}；${sample.sampled ? '采样' : ''}目标 ${summary}。${sample.distances.every(d => d === 0) ? '相机位于分块包围盒内，请拉远镜头。' : ''}`;
+};
+
 const applyLodDebugSettings = () => {
     const gsplat = getActiveLodGsplat();
     if (!gsplat) return;
@@ -695,17 +749,32 @@ const applyLodDebugSettings = () => {
         gsplat.lodRangeMax = lod;
         currentLodEl.textContent = `L${lod}`;
     }
-    if (lodBaseDistanceRange) {
-        const dist = Math.max(0.1, Number(lodBaseDistanceRange.value) || 10);
-        gsplat.lodBaseDistance = dist;
-        if (lodBaseDistanceVal) lodBaseDistanceVal.textContent = String(dist);
-    }
-    if (lodMultiplierRange) {
-        const mult = Math.max(0.1, (Number(lodMultiplierRange.value) || 10) / 10);
-        gsplat.lodMultiplier = mult;
-        if (lodMultiplierVal) lodMultiplierVal.textContent = mult.toFixed(1);
-    }
+    const settings = normalizeLodSettings(lodBaseDistanceInput.value, Number(lodMultiplierRange.value) / 10);
+    gsplat.lodBaseDistance = settings.base;
+    gsplat.lodMultiplier = settings.multiplier;
+    lodBaseDistanceInput.value = String(settings.base);
+    lodBaseDistanceRange.value = String(Math.log10(settings.base));
+    lodBaseDistanceVal.textContent = formatLodDistance(gsplat.lodBaseDistance);
+    lodMultiplierRange.value = String(gsplat.lodMultiplier * 10);
+    lodMultiplierVal.textContent = gsplat.lodMultiplier.toFixed(1);
+    for (const el of [lodBaseDistanceInput, lodBaseDistanceRange, lodMultiplierRange]) el.disabled = isolate !== 'all';
+    // Re-evaluate even while the camera is stationary; debug follows distance only.
+    app.scene.gsplat.splatBudget = 0;
+    app.scene.gsplat.lodUpdateDistance = 0;
+    app.scene.gsplat.dirty = true;
     setLodColorize(Boolean(lodColorizeToggle?.checked));
+    updateLodDistanceInfo();
+};
+
+const fitLodDebugToView = () => {
+    const sample = getLodDistanceSample();
+    if (!sample) return;
+    const sorted = sample.distances.filter(d => d > 0).sort((a, b) => a - b);
+    const reference = sorted[Math.floor(sorted.length / 2)] || sample.resource.aabb.halfExtents.length() * sample.scale || 10;
+    lodIsolateSelect.value = 'all';
+    lodMultiplierRange.value = '30';
+    lodBaseDistanceInput.value = String(Number(fitLodBase(reference, sample.levels).toPrecision(4)));
+    applyLodDebugSettings();
 };
 
 const setLodDebugUiVisible = (visible) => {
@@ -802,7 +871,7 @@ const loadGsplatUrl = async (url, options = {}) => {
         // Without this, multi-chunk previews occlude each other by entity order (wrong).
         unified = true,
         lodBaseDistance = 10,
-        lodMultiplier = 1,
+        lodMultiplier = 3,
         retries = 6,
         /** When false, skip auto camera framing (e.g. loading many chunks) */
         frameCamera = true,
@@ -931,7 +1000,7 @@ const loadFinalLodMeta = async (metaUrl) => {
             unified: true,
             useLodDistances: true,
             lodBaseDistance: 10,
-            lodMultiplier: 1,
+            lodMultiplier: 3,
             frameCamera: true,
             retries: 6
         });
@@ -941,6 +1010,9 @@ const loadFinalLodMeta = async (metaUrl) => {
         setStatusPhase('完成', 'ok');
         setProgress('转换完成：已加载完整多层 LOD。可用「LOD 调试」按层级着色查看。', 100);
         setLodDebugUiVisible(true);
+        requestAnimationFrame(() => {
+            if (generation === previewGeneration) fitLodDebugToView();
+        });
         updatePreviewChrome();
         return true;
     } catch (error) {
@@ -1927,10 +1999,11 @@ const resetPanel = async () => {
         compareImportLeft = compareImportRight = null;
         lodImportPath.value = '';
         lodIsolateSelect.value = 'all';
-        lodBaseDistanceRange.value = '10';
+        lodBaseDistanceRange.value = '1';
+        lodBaseDistanceInput.value = '10';
         lodBaseDistanceVal.textContent = '10';
-        lodMultiplierRange.value = '10';
-        lodMultiplierVal.textContent = '1.0';
+        lodMultiplierRange.value = '30';
+        lodMultiplierVal.textContent = '3.0';
         compareSplit = 0.5;
         updateInputDropHint('');
         chunkCountKEl.value = '512';
@@ -3395,8 +3468,19 @@ if (lodIsolateSelect) {
     });
 }
 if (lodBaseDistanceRange) {
-    lodBaseDistanceRange.addEventListener('input', applyLodDebugSettings);
+    lodBaseDistanceRange.addEventListener('input', () => {
+        lodBaseDistanceInput.value = String(Number((10 ** Number(lodBaseDistanceRange.value)).toPrecision(4)));
+        applyLodDebugSettings();
+    });
 }
+lodBaseDistanceInput.addEventListener('change', applyLodDebugSettings);
+lodBaseDistanceInput.addEventListener('input', () => {
+    if (lodBaseDistanceInput.value && lodBaseDistanceInput.validity.valid) applyLodDebugSettings();
+});
+lodFitDistanceBtn.addEventListener('click', () => {
+    fitLodDebugToView();
+    setProgress('已按当前视角匹配 LOD 距离，恢复自动切换；拉近或拉远镜头可检查各层效果。');
+});
 if (lodMultiplierRange) {
     lodMultiplierRange.addEventListener('input', applyLodDebugSettings);
 }

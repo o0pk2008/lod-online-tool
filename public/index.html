@@ -63,7 +63,7 @@
     <script type="importmap">
     {
         "imports": {
-            "playcanvas": "https://cdn.jsdelivr.net/npm/playcanvas/+esm"
+            "playcanvas": "https://cdn.jsdelivr.net/npm/playcanvas@2.21.3/+esm"
         }
     }
     </script>
@@ -346,7 +346,7 @@
                                 <input id="compareRightFile" type="file" accept=".ply,.sog,.splat,.spz,.ksplat,.compressed.ply" class="hidden" />
                             </div>
                         </div>
-                        <div id="lodDebugPanel" class="hidden absolute bottom-14 right-3 z-10 w-[250px] rounded-xl bg-black/60 text-white backdrop-blur ring-1 ring-white/15 p-3 pointer-events-auto">
+                        <div id="lodDebugPanel" class="hidden absolute bottom-14 right-3 z-10 w-[280px] max-w-[calc(100%_-_24px)] max-h-[75%] overflow-y-auto rounded-xl bg-black/60 text-white backdrop-blur ring-1 ring-white/15 p-3 pointer-events-auto">
                             <div class="text-[12px] font-semibold mb-2">LOD 调试</div>
                             <label class="flex items-center justify-between gap-2 text-[11px] mb-2">
                                 <span>按层级着色</span>
@@ -361,13 +361,17 @@
                                 <span>切换距离</span>
                                 <span id="lodBaseDistanceVal">10</span>
                             </label>
-                            <input id="lodBaseDistanceRange" type="range" min="1" max="80" step="1" value="10" class="ts-range w-full mb-2" />
+                            <input id="lodBaseDistanceRange" aria-label="切换距离（对数刻度）" type="range" min="-1" max="6" step="0.01" value="1" class="ts-range w-full mb-1 disabled:opacity-40" />
+                            <input id="lodBaseDistanceInput" aria-label="切换距离数值" type="number" min="0.1" max="1000000" step="any" value="10" class="w-full mb-2 rounded-lg bg-[#1a2333] px-2 py-1 text-[12px] disabled:opacity-40" />
                             <label class="flex items-center justify-between text-[11px] text-white/70 mb-1">
                                 <span>层间倍率</span>
-                                <span id="lodMultiplierVal">1.0</span>
+                                <span id="lodMultiplierVal">3.0</span>
                             </label>
-                            <input id="lodMultiplierRange" type="range" min="1" max="40" step="1" value="10" class="ts-range w-full" />
-                            <p class="mt-2 text-[10px] text-white/55 leading-relaxed">着色打开后，不同颜色对应当前正在显示的 LOD 层。拉远镜头可看到更粗的层。</p>
+                            <input id="lodMultiplierRange" aria-label="层间倍率" type="range" min="12" max="80" step="1" value="30" class="ts-range w-full disabled:opacity-40" />
+                            <button id="lodFitDistanceBtn" type="button" class="w-full mt-2 rounded-lg bg-white/15 px-2 py-1.5 text-[11px] hover:bg-white/25">按当前视角匹配距离（恢复自动）</button>
+                            <p id="lodDistanceInfo" class="mt-2 text-[11px] leading-relaxed" aria-live="polite"></p>
+                            <p id="lodThresholdInfo" class="mt-2 text-[10px] text-cyan-200 leading-relaxed"></p>
+                            <p class="mt-2 text-[10px] text-white/55 leading-relaxed">距离按相机到分块包围盒计算，并受视野角度影响。目标层不代表已加载完成；开启着色可核对实际显示。LOD 是分级切换，不是透明渐变。单独选层会暂停自动切换。</p>
                         </div>
                         <div class="absolute bottom-3 left-3 right-3 flex flex-wrap gap-2 text-[11px] text-white/70 pointer-events-none">
                             <span class="rounded-md bg-black/35 px-2 py-1 ring-1 ring-white/10">左键旋转</span>
