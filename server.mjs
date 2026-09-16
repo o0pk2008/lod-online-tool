@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process';
 import { createReadStream, createWriteStream, existsSync } from 'node:fs';
-import { access, mkdir, open, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
+import { access, mkdir, mkdtemp, open, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
@@ -92,6 +92,7 @@ const sseClients = new Set();
 let activeRun = null;
 /** Last finished/stopped run snapshot (for refresh after complete) */
 let lastRunSnapshot = null;
+let snapshotEpoch = 0;
 let fileIdCounter = 1;
 const fileRegistry = new Map();
 /** @type {Map<string, string>} runId/token -> absolute output root */
@@ -960,6 +961,7 @@ const streamLines = (stream, runState, type) => {
 const stopActiveRun = (reason = 'stopped') => {
     if (!activeRun) return false;
     const stopped = activeRun;
+    const epoch = snapshotEpoch;
     activeRun.cancelled = true;
     if (activeRun.child && !activeRun.child.killed) {
         activeRun.child.kill();
@@ -967,9 +969,9 @@ const stopActiveRun = (reason = 'stopped') => {
     sseBroadcast('run-stopped', { runId: activeRun.runId, reason });
     // Snapshot after disk reconcile (async); keep reference for restore
     getRunSnapshot(stopped).then((snap) => {
-        lastRunSnapshot = snap;
+        if (epoch === snapshotEpoch) lastRunSnapshot = snap;
     }).catch(() => {
-        lastRunSnapshot = null;
+        if (epoch === snapshotEpoch) lastRunSnapshot = null;
     });
     activeRun = null;
     return true;
@@ -2239,6 +2241,17 @@ const server = http.createServer(async (req, res) => {
         return;
     }
 
+    if (req.method === 'POST' && reqUrl.pathname === '/api/reset-panel') {
+        if (activeRun) {
+            sendJson(res, 409, { error: '任务仍在运行，请先停止后重置。' });
+            return;
+        }
+        snapshotEpoch++;
+        lastRunSnapshot = null;
+        sendJson(res, 200, { ok: true });
+        return;
+    }
+
     if (req.method === 'GET' && reqUrl.pathname === '/api/defaults') {
         const localClient = isLocalClient(req);
         sendJson(res, 200, {
@@ -2612,6 +2625,38 @@ const server = http.createServer(async (req, res) => {
         try {
             const body = await parseBody(req);
             const kind = `${body.kind ?? ''}`.trim();
+            if (kind === 'input') {
+                const opened = await resolveComparePreviewFile(body.path, '输入');
+                if (!isLocalClient(req) && !isPathInside(opened.absPath, inputWorkspaceRoot)) {
+                    sendJson(res, 403, { error: '请先上传模型到输入目录。' });
+                    return;
+                }
+                // PlayCanvas directly reads PLY/SOG; normalize other accepted inputs
+                // in a separate process without starting a conversion task.
+                if (!['.ply', '.sog'].includes(path.extname(opened.name).toLowerCase())) {
+                    const dir = await mkdtemp(path.join(os.tmpdir(), 'lod-input-preview-'));
+                    const converted = path.join(dir, 'preview.ply');
+                    try {
+                        await new Promise((resolve, reject) => {
+                            const child = spawn(process.execPath, [cliPath(), opened.absPath, converted], { cwd: splatTransformRoot, windowsHide: true });
+                            let errorText = '';
+                            child.stdout.resume();
+                            child.stderr.on('data', chunk => { errorText = (errorText + chunk).slice(-2000); });
+                            child.on('error', reject);
+                            child.on('close', code => code === 0 ? resolve() : reject(new Error(errorText || '输入格式转换失败')));
+                        });
+                        opened.url = makeInputPreviewUrl(converted);
+                        opened.name = 'preview.ply';
+                    } catch (error) {
+                        if (isPathInside(dir, os.tmpdir()) && path.basename(dir).startsWith('lod-input-preview-')) {
+                            await rm(dir, { recursive: true, force: true });
+                        }
+                        throw error;
+                    }
+                }
+                sendJson(res, 200, { ok: true, ...opened });
+                return;
+            }
             if (kind === 'lod') {
                 const opened = await resolveLodPreviewRoot(body.path);
                 sendJson(res, 200, {
@@ -2741,8 +2786,8 @@ const server = http.createServer(async (req, res) => {
         return;
     }
 
-    if (req.method === 'GET' && reqUrl.pathname === '/app.js') {
-        await serveFile(res, path.join(publicDir, 'app.js'));
+    if (req.method === 'GET' && ['/app.js', '/chunk-plan.js', '/chunk-plan-worker.js'].includes(reqUrl.pathname)) {
+        await serveFile(res, path.join(publicDir, reqUrl.pathname.slice(1)));
         return;
     }
 

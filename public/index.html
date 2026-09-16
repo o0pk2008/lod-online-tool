@@ -193,7 +193,15 @@
                                 </div>
                             </div>
                             <div class="mb-3 text-[11px] text-[#7b8494] leading-relaxed rounded-lg bg-[#f2f6fb] px-2.5 py-2">
-                                分块规模为全局参数（约 K×1000 个高斯/块）。数值越大，块越少但单块越大。
+                                分块规模为全局参数（K×1024 个高斯）。数值越大，块通常越少；空间跨度也会触发细分。
+                            </div>
+                            <div class="mb-3 space-y-2 rounded-lg bg-[#f2f6fb] px-2.5 py-2 text-[11px] text-[#526077]">
+                                <label class="flex items-center justify-between" for="chunkExtent">最大分块跨度 (-X，模型单位)
+                                    <input id="chunkExtent" type="number" min="1" step="1" value="16" class="w-20 border rounded-lg p-1.5" />
+                                </label>
+                                <label class="flex items-center gap-2"><input id="showPlanBoxes" type="checkbox" checked />显示分块规划 box</label>
+                                <button id="sourcePreviewBtn" type="button" class="rounded-lg border px-2 py-1 hover:bg-white">预览输入模型 / 返回规划</button>
+                                <p id="planHint" role="status">导入模型后显示分块规划预览。</p>
                             </div>
 
                             <div class="flex items-center justify-between mb-2">
@@ -248,6 +256,7 @@
                                     </span>
                                 </button>
                                 <button id="stopBtn" class="px-3 py-2 border border-[#cfd9ea] bg-white text-[13px] font-semibold rounded-full hover:bg-[#f6f9ff]">停止</button>
+                                <button id="resetPanelBtn" type="button" title="清空面板并恢复默认参数，保留磁盘文件；运行中请先停止" class="px-3 py-2 border border-[#cfd9ea] bg-white text-[13px] font-semibold rounded-full hover:bg-[#f6f9ff] disabled:opacity-40">重置面板</button>
                             </div>
                         </div>
 

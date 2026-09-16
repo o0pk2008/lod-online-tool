@@ -2,6 +2,7 @@ import {
     Application,
     Asset,
     AssetListLoader,
+    BoundingBox,
     Color,
     Entity,
     FILLMODE_NONE,
@@ -19,6 +20,21 @@ const levelFormEl = document.getElementById('levelForm');
 const settingsPanelEl = document.getElementById('settingsPanel');
 const lodCountEl = document.getElementById('lodCount');
 const chunkCountKEl = document.getElementById('chunkCountK');
+const chunkExtentEl = document.getElementById('chunkExtent');
+const resetPanelBtn = document.getElementById('resetPanelBtn');
+const sourcePreviewBtn = document.getElementById('sourcePreviewBtn');
+const showPlanBoxes = document.getElementById('showPlanBoxes');
+const planHint = document.getElementById('planHint');
+let previewGeneration = 0;
+let sourceRequest = 0;
+let planWorker = null;
+let planRevision = 0;
+let planTimer = null;
+let planLines = [];
+let sourceEntity = null;
+let panelResetting = false;
+let uiRunning = false;
+let panelEpoch = 0;
 const startBtn = document.getElementById('startBtn');
 const startBtnLabel = document.getElementById('startBtnLabel');
 const startBtnSpinner = document.getElementById('startBtnSpinner');
@@ -137,6 +153,7 @@ let showingFinalLod = false;
 /** 0 idle · 1 simplify intermediates · 2 compose lod-meta · 3 final */
 let pipelinePhase = 0;
 const PREVIEW_MODE = {
+    source: 'source',
     none: 'none',
     intermediate: 'intermediate',
     chunks: 'chunks',
@@ -251,12 +268,19 @@ const frameEntityInView = (entity) => {
     try {
         const gsplat = entity?.gsplat;
         // Prefer custom AABB if engine exposes it
-        const aabb = gsplat?.customAabb || gsplat?.aabb || entity?.render?.meshInstances?.[0]?.aabb;
+        const resource = gsplat?.asset == null ? null : app.assets.get(gsplat.asset)?.resource;
+        let aabb = gsplat?.customAabb || gsplat?.aabb || entity?.render?.meshInstances?.[0]?.aabb;
+        if (resource?.aabb) {
+            aabb = new BoundingBox();
+            aabb.setFromTransformedAabb(resource.aabb, entity.getWorldTransform());
+        }
         if (!aabb || !aabb.halfExtents) return false;
 
         const center = aabb.center;
         const he = aabb.halfExtents;
-        const radius = Math.max(he.x, he.y, he.z, 1) * 2.2;
+        const vfov = camera.camera.fov * Math.PI / 360;
+        const hfov = Math.atan(Math.tan(vfov) * Math.max(0.1, canvas.clientWidth / Math.max(1, canvas.clientHeight)));
+        const radius = Math.max(he.length(), 0.1) / Math.sin(Math.min(vfov, hfov)) * 1.15;
         target.set(center.x, center.y, center.z);
         distance = clamp(radius, ORBIT_MIN_DISTANCE, ORBIT_MAX_DISTANCE);
         applyOrbit();
@@ -408,6 +432,9 @@ const drawReferenceGrid = () => {
 
 app.on('update', () => {
     drawReferenceGrid();
+    if (previewMode === PREVIEW_MODE.source && currentMode === WORK_MODE.lod && showPlanBoxes.checked && planLines.length) {
+        app.drawLines(planLines, new Color(0.2, 0.9, 1), false);
+    }
     syncCompareCameraTransform();
 });
 
@@ -695,6 +722,14 @@ const setLodDebugUiVisible = (visible) => {
 };
 
 const clearCurrentLevelRender = () => {
+    previewGeneration++;
+    sourceRequest++;
+    planWorker?.terminate();
+    clearTimeout(planTimer);
+    planWorker = null;
+    sourceEntity = null;
+    planLines = [];
+    planHint.textContent = '导入模型后显示分块规划预览。';
     setLodDebugUiVisible(false);
     disableCompareView();
     while (chunkEntities.length > 0) {
@@ -720,7 +755,9 @@ const hasPreviewContent = () => (
 
 const updatePreviewChrome = () => {
     const hasContent = hasPreviewContent();
-    const busy = Boolean(activeRunId);
+    const busy = Boolean(activeRunId) || uiRunning;
+    resetPanelBtn.disabled = busy || panelResetting;
+    sourcePreviewBtn.disabled = busy || panelResetting || !inputPathEl.value.trim();
     if (previewEmptyState) {
         previewEmptyState.classList.toggle('hidden', hasContent || busy);
     }
@@ -758,6 +795,7 @@ const clearPreviewData = () => {
 };
 
 const loadGsplatUrl = async (url, options = {}) => {
+    const generation = previewGeneration;
     const {
         name = `gsplat-${Date.now()}`,
         // PlayCanvas global sorting: all unified gsplat components share one depth sort.
@@ -774,14 +812,16 @@ const loadGsplatUrl = async (url, options = {}) => {
 
     let lastError = null;
     for (let attempt = 0; attempt < retries; attempt += 1) {
+        let asset;
         try {
             const bust = `${cacheKey || Date.now()}-${attempt}-${Date.now()}`;
             const cacheBusted = `${url}${url.includes('?') ? '&' : '?'}v=${encodeURIComponent(bust)}`;
-            const asset = new Asset(name, 'gsplat', { url: cacheBusted });
+            asset = new Asset(name, 'gsplat', { url: cacheBusted, filename: options.filename || url.split('?')[0] });
             const loader = new AssetListLoader([asset], app.assets);
             await new Promise((resolve, reject) => {
                 loader.load((err) => (err ? reject(err) : resolve()));
             });
+            if (generation !== previewGeneration) throw new Error('预览已取消');
 
             const entity = new Entity(name);
             entity.setEulerAngles(0, 0, 180);
@@ -811,12 +851,15 @@ const loadGsplatUrl = async (url, options = {}) => {
             if (frameCamera) {
                 // Defer framing one frame so gsplat AABB is ready
                 requestAnimationFrame(() => {
+                    if (generation !== previewGeneration) return;
                     frameEntityInView(entity);
                     syncCameraClipPlanes();
                 });
             }
             return entity;
         } catch (error) {
+            if (asset) { app.assets.remove(asset); asset.unload(); }
+            if (generation !== previewGeneration) throw error;
             lastError = error;
             await sleep(350 + attempt * 250);
         }
@@ -838,6 +881,7 @@ const loadIntermediatePreview = async (data) => {
 
     clearCurrentLevelRender();
     previewMode = PREVIEW_MODE.intermediate;
+    const generation = previewGeneration;
     currentLod = Number(data.lod);
     currentLodEl.textContent = `L${currentLod}`;
     setViewMode(`阶段1 中间预览 · L${currentLod}`);
@@ -859,6 +903,7 @@ const loadIntermediatePreview = async (data) => {
         updatePreviewChrome();
         return true;
     } catch (error) {
+        if (generation !== previewGeneration) return false;
         setViewMode(`L${data.lod} 中间预览失败`);
         setProgress(`中间文件预览失败 L${data.lod}: ${error.message || error}（文件仍可用于合成）`);
         setChunkTaskStatus(data.taskName || `中间 L${data.lod}`, '已计算', 100);
@@ -875,6 +920,7 @@ const loadFinalLodMeta = async (metaUrl) => {
     if (!metaUrl) return false;
     clearCurrentLevelRender();
     showingFinalLod = true;
+    const generation = previewGeneration;
     previewMode = PREVIEW_MODE.final;
     pipelinePhase = 3;
     currentLodEl.textContent = 'ALL';
@@ -898,6 +944,7 @@ const loadFinalLodMeta = async (metaUrl) => {
         updatePreviewChrome();
         return true;
     } catch (error) {
+        if (generation !== previewGeneration) return false;
         setStatusPhase('完成(预览失败)', 'warn');
         setProgress(`最终 lod-meta 加载失败: ${error.message || error}`);
         updatePreviewChrome();
@@ -917,6 +964,7 @@ const loadComparePreview = async (payload) => {
 
     clearCurrentLevelRender();
     previewMode = PREVIEW_MODE.compare;
+    const generation = previewGeneration;
     pipelinePhase = 3;
     currentLodEl.textContent = `${Number(data.keepPercent ?? keepPercent)}%`;
     updateCompareLabels(data);
@@ -949,6 +997,7 @@ const loadComparePreview = async (payload) => {
     };
 
     const loadSingle = async (url, label) => {
+        if (generation !== previewGeneration) throw new Error('预览已取消');
         disableCompareView();
         previewMode = PREVIEW_MODE.compare;
         await loadGsplatUrl(url, {
@@ -1010,6 +1059,7 @@ const loadComparePreview = async (payload) => {
         );
         return true;
     } catch (error) {
+        if (generation !== previewGeneration) return false;
         const fallbackUrl = compressedUrl || originalUrl;
         try {
             if (!fallbackUrl) throw error;
@@ -1018,6 +1068,7 @@ const loadComparePreview = async (payload) => {
             setProgress(`未能左右对比（${error.message || error}），已显示压缩结果。`, 100);
             return true;
         } catch (fallbackError) {
+            if (generation !== previewGeneration) return false;
             disableCompareView();
             setStatusPhase('完成(预览失败)', 'warn');
             setProgress(`预览失败: ${fallbackError.message || fallbackError}。结果文件仍在输出目录中。`);
@@ -1129,6 +1180,8 @@ const renderTaskTable = () => {
 };
 
 const setUiRunningState = (running) => {
+    uiRunning = running;
+    resetPanelBtn.disabled = running || panelResetting;
     startBtn.disabled = running;
     stopBtn.disabled = !running;
     startBtn.setAttribute('aria-busy', running ? 'true' : 'false');
@@ -1150,6 +1203,7 @@ const setUiRunningState = (running) => {
         '#downloadOutputBtn',
         '#lodCount',
         '#chunkCountK',
+        '#chunkExtent',
         '#levelForm input',
         '#inputFileHidden',
         '#keepPercentRange',
@@ -1310,6 +1364,7 @@ const setInputPathValue = (value, { autoOutput = true, forceOutput = false } = {
     saveConfigToStorage();
     scheduleRefreshOutputDownloads();
     if (next) scheduleEnsureOutputDirectory();
+    previewInputModel();
 };
 
 let outputDownloadPrimary = null;
@@ -1429,6 +1484,7 @@ const refreshOutputDownloads = async () => {
     try {
         const res = await fetch(`/api/output-files?root=${encodeURIComponent(root)}`);
         const data = await res.json();
+        if (root !== outputRootEl.value.trim() || panelResetting) return;
         if (!res.ok) {
             clearDownloadState(data.error || '无法读取输出目录');
             return;
@@ -1572,6 +1628,7 @@ const collectDroppedPath = (dt, file = null) => {
 };
 
 const uploadDroppedFile = async (file) => {
+    const epoch = panelEpoch;
     const name = file.name || 'upload.ply';
     const sizeHint = Number.isFinite(file.size) ? `（${formatBytes(file.size)}）` : '';
     setProgress(`正在上传 ${name}${sizeHint} …`);
@@ -1583,6 +1640,7 @@ const uploadDroppedFile = async (file) => {
         xhr.setRequestHeader('Content-Type', 'application/octet-stream');
         xhr.setRequestHeader('X-File-Name', encodeURIComponent(name));
         xhr.upload.onprogress = (event) => {
+            if (epoch !== panelEpoch) return;
             if (!event.lengthComputable) return;
             const pct = Math.round((event.loaded / event.total) * 100);
             setProgress(
@@ -1607,6 +1665,7 @@ const uploadDroppedFile = async (file) => {
         xhr.send(file);
     });
 
+    if (epoch !== panelEpoch) return;
     if (data.outputRoot) {
         lastSuggestedOutput = data.outputRoot;
         outputRootEl.value = data.outputRoot;
@@ -1635,6 +1694,7 @@ const ensureOutputDirectory = async () => {
             })
         });
         const data = await res.json().catch(() => ({}));
+        if (inputPath !== inputPathEl.value.trim() || outputRoot !== outputRootEl.value.trim() || panelResetting) return null;
         if (!res.ok) {
             throw new Error(data.error || '创建输出目录失败');
         }
@@ -1771,6 +1831,136 @@ const pumpChunkLoads = async () => {
     }
 };
 
+const updateChunkPlan = () => {
+    if (!planWorker || !sourceEntity) return;
+    clearTimeout(planTimer);
+    const id = ++planRevision;
+    planTimer = setTimeout(() => {
+        if (!planWorker || !sourceEntity) return;
+        const levels = collectLevelsFromUi();
+        const lodWeight = levels.reduce((sum, level) => sum + (level.lod === 0 ? 1 : (parseFloat(level.decimate) || 0) / 100), 0);
+        planHint.textContent = '正在更新分块规划…';
+        planWorker.postMessage({ id, chunkCountK: Math.max(1, Math.round(Number(chunkCountKEl.value) || 512)),
+            chunkExtent: Math.max(1, Math.round(Number(chunkExtentEl.value) || 16)), lodWeight: Math.max(1, lodWeight) });
+    }, 120);
+};
+
+const previewInputModel = async () => {
+    if (activeRunId || uiRunning || panelResetting) return;
+    clearCurrentLevelRender();
+    updatePreviewChrome();
+    const request = sourceRequest;
+    const inputPath = inputPathEl.value.trim();
+    if (!inputPath) return;
+    planHint.textContent = '正在加载输入模型…';
+    setViewMode('加载输入模型');
+    try {
+        const res = await fetch('/api/open-preview', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ kind: 'input', path: inputPath }) });
+        const data = await res.json();
+        if (request !== sourceRequest) return;
+        if (!res.ok) throw new Error(data.error || '输入预览失败');
+        const entity = await loadGsplatUrl(data.url, { name: 'input-model', filename: data.name, retries: 1, frameCamera: false });
+        if (request !== sourceRequest) return;
+        sourceEntity = entity;
+        previewMode = PREVIEW_MODE.source;
+        setViewMode('输入模型 · 计算前规划');
+        updatePreviewChrome();
+        const resource = app.assets.get(entity.gsplat.asset)?.resource;
+        const centers = resource?.centers || resource?.gsplatData?.getCenters?.();
+        if (!centers?.length) throw new Error('模型已显示，但当前格式无法读取空间点位用于规划');
+        const totalCount = centers.length / 3;
+        const count = Math.min(totalCount, 100000);
+        const positions = new Float32Array(count * 3);
+        for (let i = 0; i < count; i++) {
+            const j = Math.floor(i * totalCount / count) * 3;
+            positions.set(centers.subarray(j, j + 3), i * 3);
+        }
+        planWorker = new Worker('/chunk-plan-worker.js', { type: 'module' });
+        planWorker.onerror = () => { planHint.textContent = '分块规划失败，请重新预览输入模型。'; };
+        planWorker.onmessage = ({ data: result }) => {
+            if (request !== sourceRequest || result.id !== planRevision) return;
+            const transform = entity.getWorldTransform();
+            const lines = [];
+            for (const box of result.boxes) {
+                const corners = Array.from({ length: 8 }, (_, i) => transform.transformPoint(new Vec3(
+                    (i & 1 ? box.max : box.min)[0], (i & 2 ? box.max : box.min)[1], (i & 4 ? box.max : box.min)[2])));
+                for (let i = 0; i < 8; i++) for (const bit of [1, 2, 4]) {
+                    if (!(i & bit)) lines.push(corners[i], corners[i | bit]);
+                }
+            }
+            planLines = lines;
+            planHint.textContent = `${totalCount.toLocaleString()} 个高斯 · ${result.boxes.length} 个规划 box${result.limited ? '（已达预览精度上限）' : ''}。基于采样点与各层保留率估算，最终边界以计算结果为准。`;
+        };
+        planWorker.postMessage({ positions, totalCount }, [positions.buffer]);
+        updateChunkPlan();
+        // Use the same transformed resource bounds as the planning boxes.
+        frameEntityInView(entity);
+    } catch (error) {
+        if (request !== sourceRequest) return;
+        planHint.textContent = `预览提示：${error.message}`;
+        if (previewMode !== PREVIEW_MODE.source) setViewMode('输入预览失败');
+        updatePreviewChrome();
+    }
+};
+
+const resetPanel = async () => {
+    if (activeRunId || uiRunning || panelResetting) return;
+    panelResetting = true;
+    resetPanelBtn.disabled = true;
+    try {
+        const res = await fetch('/api/reset-panel', { method: 'POST' });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || '重置失败');
+        panelEpoch++;
+        clearTimeout(outputListTimer);
+        clearTimeout(ensureOutputTimer);
+        clearPreviewData();
+        chunkTasks.clear();
+        levelChunkQueue.clear();
+        inputPathEl.value = '';
+        outputRootEl.value = '';
+        lastSuggestedOutput = '';
+        inputFileHidden.value = '';
+        compareLeftFile.value = '';
+        compareRightFile.value = '';
+        compareImportLeft = compareImportRight = null;
+        lodImportPath.value = '';
+        lodIsolateSelect.value = 'all';
+        lodBaseDistanceRange.value = '10';
+        lodBaseDistanceVal.textContent = '10';
+        lodMultiplierRange.value = '10';
+        lodMultiplierVal.textContent = '1.0';
+        compareSplit = 0.5;
+        updateInputDropHint('');
+        chunkCountKEl.value = '512';
+        chunkExtentEl.value = '16';
+        showPlanBoxes.checked = true;
+        levelState = [5, 4, 3, 2, 1, 0].map((lod, i) => ({ lod, decimate: lod ? ['15%', '25%', '40%', '60%', '80%'][i] : '', chunkCountK: 512 }));
+        buildLevelForm(levelState);
+        lodCountEl.value = '6';
+        syncKeepPercentUi(60);
+        applyWorkMode(WORK_MODE.lod, { syncOutput: false });
+        renderTaskTable();
+        syncCompareImportButtons();
+        clearDownloadState('暂无输出结果');
+        saveConfigToStorage();
+        setWorkflowStep(1);
+        setProgress('面板已重置，可导入新模型。磁盘上的输入与计算结果保留。', 0);
+    } catch (error) {
+        setProgress(`重置失败：${error.message}`);
+    } finally {
+        panelResetting = false;
+        updatePreviewChrome();
+    }
+};
+
+resetPanelBtn.addEventListener('click', resetPanel);
+sourcePreviewBtn.addEventListener('click', previewInputModel);
+chunkExtentEl.addEventListener('input', () => { saveConfigToStorage(); updateChunkPlan(); });
+levelFormEl.addEventListener('input', updateChunkPlan);
+lodCountEl.addEventListener('change', updateChunkPlan);
+
 const saveConfigToStorage = () => {
     try {
         const levels = levelFormEl.querySelector('[data-level-row]')
@@ -1783,6 +1973,7 @@ const saveConfigToStorage = () => {
             outputRoot: outputRootEl.value.trim(),
             lodCount: Number(lodCountEl.value) || levels.length,
             chunkCountK: Math.max(1, Number(chunkCountKEl?.value) || 512),
+            chunkExtent: Math.max(1, Number(chunkExtentEl.value) || 16),
             levels
         };
         localStorage.setItem(CONFIG_STORAGE_KEY, JSON.stringify(payload));
@@ -1803,6 +1994,7 @@ const loadConfigFromStorage = () => {
 
 const applyConfigToForm = (cfg) => {
     if (!cfg) return;
+    chunkExtentEl.value = String(Math.max(1, Number(cfg.chunkExtent) || 16));
     if (cfg.keepPercent != null) {
         syncKeepPercentUi(cfg.keepPercent);
     }
@@ -1844,7 +2036,8 @@ const applyRunSnapshot = async (snapshot, { fromRefresh = false } = {}) => {
 
     isRestoringSnapshot = true;
     try {
-        activeRunId = snapshot.runId;
+        activeRunId = snapshot.active || snapshot.status === 'running' ? snapshot.runId : null;
+        chunkExtentEl.value = String(snapshot.chunkExtent || 16);
         finalLodMetaUrl = snapshot.outputMetaUrl || null;
         pipelinePhase = Number(snapshot.phase) || 0;
         currentLod = snapshot.currentLod ?? null;
@@ -1976,6 +2169,7 @@ const applyRunSnapshot = async (snapshot, { fromRefresh = false } = {}) => {
 const eventSource = new EventSource('/events');
 
 eventSource.addEventListener('run-snapshot', (evt) => {
+    if (panelResetting) return;
     const data = JSON.parse(evt.data);
     // Prefer API restore on boot; this covers late SSE reconnect mid-run
     if (!activeRunId || activeRunId === data.runId) {
@@ -2316,6 +2510,7 @@ eventSource.addEventListener('run-complete', async (evt) => {
         if (activeRunId === completedRunId) {
             activeRunId = null;
         }
+        updatePreviewChrome();
         refreshOutputDownloads();
         if (!loaded) {
             setStatusPhase('完成(预览失败)', 'warn');
@@ -2332,6 +2527,7 @@ eventSource.addEventListener('run-complete', async (evt) => {
     if (activeRunId === completedRunId) {
         activeRunId = null;
     }
+    updatePreviewChrome();
     refreshOutputDownloads();
     if (!loaded) {
         setStatusPhase('完成(预览失败)', 'warn');
@@ -2348,8 +2544,8 @@ eventSource.addEventListener('run-error', (evt) => {
         setChunkTaskStatus(currentChunkName, '计算失败');
         renderTaskTable();
     }
-    setUiRunningState(false);
     activeRunId = null;
+    setUiRunningState(false);
     currentChunkName = null;
     refreshOutputDownloads();
     setWorkflowStep(2);
@@ -2507,6 +2703,8 @@ const initializeDefaults = async () => {
         const status = await statusRes.json();
         if (status?.run) {
             await applyRunSnapshot(status.run, { fromRefresh: true });
+        } else if (inputPathEl.value.trim()) {
+            await previewInputModel();
         }
     } catch (error) {
         setProgress(`恢复任务状态失败: ${error.message || error}`);
@@ -2602,6 +2800,7 @@ const validateBeforeStart = () => {
         outputRoot,
         levels: levelState,
         chunkCountK,
+        chunkExtent: Math.max(1, Math.round(Number(chunkExtentEl.value) || 16)),
         // Keep intermediates when possible (large-data friendly). Full rebuild: delete output dir first.
         resume: true
     };
@@ -2643,12 +2842,14 @@ stopBtn.addEventListener('click', async () => {
 });
 
 pickInputBtn.addEventListener('click', async () => {
+    const epoch = panelEpoch;
     if (!localClient) {
         inputFileHidden?.click();
         return;
     }
     try {
         const value = await pickPath('input');
+        if (epoch !== panelEpoch) return;
         if (value) {
             setInputPathValue(value, { autoOutput: true, forceOutput: false });
             setProgress(`已选择输入：${value}`);
@@ -2724,6 +2925,7 @@ outputRootEl.addEventListener('input', () => {
 });
 
 inputPathEl.addEventListener('change', () => {
+    previewInputModel();
     updateInputDropHint(inputPathEl.value);
     maybeAutoFillOutput(inputPathEl.value, { force: false });
     saveConfigToStorage();
@@ -2938,6 +3140,7 @@ const isAcceptedInputName = (name) => {
 };
 
 const handleDroppedFile = async (file, dt = null) => {
+    const epoch = panelEpoch;
     if (!file) return;
     const name = file.name || '';
     if (!isAcceptedInputName(name)) {
@@ -2950,6 +3153,7 @@ const handleDroppedFile = async (file, dt = null) => {
             const realPath = collectDroppedPath(dt, file);
             if (realPath) {
                 const data = await resolveDroppedInput(name, realPath);
+                if (epoch !== panelEpoch) return;
                 if (data.found && data.value) {
                     setInputPathValue(data.value, { autoOutput: true, forceOutput: false });
                     setProgress(`已选择输入：${data.value}`);
@@ -2959,7 +3163,7 @@ const handleDroppedFile = async (file, dt = null) => {
         }
         await uploadDroppedFile(file);
     } catch (error) {
-        setProgress(`导入失败: ${error.message || error}`);
+        if (epoch === panelEpoch) setProgress(`导入失败: ${error.message || error}`);
     }
 };
 
@@ -3058,6 +3262,7 @@ levelFormEl.addEventListener('input', (e) => {
 
 if (chunkCountKEl) {
     chunkCountKEl.addEventListener('input', () => {
+        updateChunkPlan();
         const num = Number(chunkCountKEl.value);
         if (!Number.isFinite(num)) return;
         const clamped = Math.max(1, Math.round(num));
@@ -3071,6 +3276,7 @@ lodCountEl.addEventListener('input', () => {
     const count = normalizeLodCountInput();
     if (count === levelState.length) return;
     rebuildLevelsByCount(count);
+    updateChunkPlan();
     if (!activeRunId) setWorkflowStep(2);
     saveConfigToStorage();
 });
